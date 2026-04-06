@@ -1,0 +1,28 @@
+# Compiled binaries
+bin/
+
+# Go
+*.exe
+*.test
+*.out
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Node
+web/node_modules/
+web/.next/
+web/.env
+web/.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/
