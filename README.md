@@ -4,7 +4,7 @@
 
 A container orchestration system built in Go, with an etcd control plane, Docker worker agents, a CLI, and a Next.js dashboard. Meghatron demonstrates how desired-state reconciliation, resource scheduling, ownership, and recovery fit together behind a Kubernetes-style API.
 
-**Portfolio / learning project.** Designed for a trusted local lab, with one control-plane process and one worker agent per Docker daemon. It is not a production Kubernetes replacement.
+**Learning project.** Designed for a trusted local lab, with one control-plane process and one worker agent per Docker daemon. It is not a production Kubernetes replacement.
 
 ![Meghatron dashboard with three real nginx replicas](docs/images/dashboard.png)
 
@@ -147,7 +147,7 @@ The [GitHub Actions workflow template](docs/ci-workflow.yml) runs backend checks
 - Reconciliation uses polling/full lists rather than etcd watches. Scale/performance claims require a separate benchmark.
 - Old unlabeled containers and old deployment pods from the original prototype are not adopted automatically. Use a fresh demo state or explicitly remove only your old prototype resources before switching versions.
 
-See [local verification results](docs/validation.md) and [portfolio notes](docs/portfolio.md) for résumé bullets and interview talking points grounded in the implementation.
+See [local verification results](docs/validation.md) for the checks run against this implementation.
 
 ## Troubleshooting and cleanup
 
