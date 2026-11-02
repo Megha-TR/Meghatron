@@ -26,3 +26,6 @@ Thumbs.db
 # Logs
 *.log
 /tmp/
+
+# Local tooling and generated TypeScript cache
+web/*.tsbuildinfo

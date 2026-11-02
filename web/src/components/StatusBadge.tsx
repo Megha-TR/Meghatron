@@ -3,6 +3,7 @@ interface StatusBadgeProps {
 }
 
 const statusStyles: Record<string, string> = {
+  Terminating: 'bg-amber-900/50 text-amber-300 border border-amber-700',
   Running:   'bg-green-900/50 text-green-400 border border-green-700',
   Succeeded: 'bg-blue-900/50 text-blue-400 border border-blue-700',
   Pending:   'bg-yellow-900/50 text-yellow-400 border border-yellow-700',
@@ -13,6 +14,7 @@ const statusStyles: Record<string, string> = {
 };
 
 const dotStyles: Record<string, string> = {
+  Terminating: 'bg-amber-400 animate-pulse',
   Running:   'bg-green-400',
   Succeeded: 'bg-blue-400',
   Pending:   'bg-yellow-400 animate-pulse',

@@ -50,7 +50,11 @@ export default function Sidebar() {
   const pathname = usePathname();
 
   return (
-    <aside className="fixed inset-y-0 left-0 w-64 bg-gray-800 flex flex-col shadow-xl z-10">
+    <>
+    <nav aria-label="Main navigation" className="lg:hidden fixed top-0 inset-x-0 h-16 flex items-center justify-around bg-gray-800 border-b border-gray-700 z-20">
+      {navLinks.map(link => <Link key={link.href} href={link.href} aria-current={pathname === link.href ? "page" : undefined} className={`text-xs px-2 py-3 ${pathname === link.href ? "text-indigo-300" : "text-gray-300"}`}>{link.label}</Link>)}
+    </nav>
+    <aside className="fixed inset-y-0 left-0 w-64 bg-gray-800 hidden lg:flex flex-col shadow-xl z-10">
       <div className="flex items-center gap-3 px-6 py-5 border-b border-gray-700">
         <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-indigo-600">
           <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -89,12 +93,13 @@ export default function Sidebar() {
 
       <div className="px-6 py-4 border-t border-gray-700">
         <p className="text-xs text-gray-500">
-          API: <span className="text-gray-400">localhost:8080</span>
+          API: <span className="text-gray-400">same-origin proxy</span>
         </p>
         <p className="text-xs text-gray-500 mt-0.5">
           Auto-refresh: <span className="text-green-400">5s</span>
         </p>
       </div>
     </aside>
+    </>
   );
 }

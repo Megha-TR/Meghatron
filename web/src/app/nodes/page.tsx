@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import { fetchJSON } from '@/lib/api';
+import { formatCPU, formatMemory } from '@/lib/format';
 import StatusBadge from '@/components/StatusBadge';
 
 interface NodeData {
@@ -35,19 +37,15 @@ export default function NodesPage() {
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
 
-  const fetchNodes = useCallback(async () => {
-    try {
-      const res = await fetch('/api/v1/nodes');
-      if (!res.ok) throw new Error(`API error: ${res.status}`);
-      const data = await res.json();
-      setNodes(Array.isArray(data) ? data : []);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch nodes');
-    } finally {
-      setLoading(false);
-      setLastRefresh(new Date());
-    }
+  const fetchNodes = useCallback(() => {
+    return fetchJSON<NodeData[]>('/api/v1/nodes')
+      .then(data => {
+        setNodes(Array.isArray(data) ? data : []);
+        setError(null);
+        setLastRefresh(new Date());
+      })
+      .catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh nodes'))
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
@@ -59,14 +57,14 @@ export default function NodesPage() {
   return (
     <div>
       {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex flex-wrap gap-4 items-center justify-between mb-8">
         <div>
           <h1 className="text-2xl font-bold text-white">Nodes</h1>
           <p className="text-gray-400 mt-1 text-sm">
             Cluster worker and control plane nodes
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2 bg-gray-800 rounded-lg px-3 py-2 border border-gray-700">
             <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
             <span className="text-xs text-gray-400">Auto-refresh 5s</span>
@@ -112,7 +110,7 @@ export default function NodesPage() {
       )}
 
       {/* Table */}
-      <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+      <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-gray-700 bg-gray-900/50">
@@ -171,12 +169,12 @@ export default function NodesPage() {
                   </td>
                   <td className="px-6 py-4">
                     <span className="font-mono text-gray-300 bg-gray-900/50 px-2 py-0.5 rounded text-xs">
-                      {node.capacity?.cpu || 'N/A'}
+                      {formatCPU(node.capacity?.cpu)}
                     </span>
                   </td>
                   <td className="px-6 py-4">
                     <span className="font-mono text-gray-300 bg-gray-900/50 px-2 py-0.5 rounded text-xs">
-                      {node.capacity?.memory || 'N/A'}
+                      {formatMemory(node.capacity?.memory)}
                     </span>
                   </td>
                   <td className="px-6 py-4">
@@ -194,7 +192,7 @@ export default function NodesPage() {
       {/* Footer */}
       {!loading && nodes.length > 0 && (
         <p className="text-xs text-gray-600 mt-3 text-right">
-          {nodes.length} node{nodes.length !== 1 ? 's' : ''} &middot; Last refreshed {lastRefresh.toLocaleTimeString()}
+          {nodes.length} node{nodes.length !== 1 ? 's' : ''} &middot; Last refreshed {lastRefresh?.toLocaleTimeString() ?? 'Never'}
         </p>
       )}
     </div>

@@ -2,135 +2,101 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
-	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/orchestration-lite/core/pkg/runtime"
-	"github.com/orchestration-lite/core/pkg/storage"
-	"github.com/orchestration-lite/core/pkg/types"
+	"github.com/Megha-TR/Meghatron/pkg/agent"
+	"github.com/Megha-TR/Meghatron/pkg/runtime"
+	"github.com/Megha-TR/Meghatron/pkg/storage"
+	"github.com/Megha-TR/Meghatron/pkg/types"
 	"github.com/google/uuid"
 )
 
 func main() {
-	nodeName := flag.String("node-name", "worker-1", "Name of this worker node")
-	etcdEndpoint := flag.String("etcd", "localhost:2379", "etcd endpoint")
+	nodeName := flag.String("node-name", "worker-1", "Unique worker name (one agent per Docker daemon)")
+	endpoint := flag.String("etcd", "localhost:2379", "etcd endpoint")
 	flag.Parse()
-
-	log.Printf("Starting node agent on %s", *nodeName)
-
-	// Connect to etcd
-	store, err := storage.NewEtcdStorage([]string{*etcdEndpoint})
+	if !types.ValidName(*nodeName) {
+		log.Fatal("invalid node name")
+	}
+	if err := run(*nodeName, *endpoint); err != nil {
+		log.Fatal(err)
+	}
+}
+func run(name, endpoint string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	store, err := storage.NewEtcdStorage([]string{endpoint})
 	if err != nil {
-		log.Fatalf("Failed to connect to etcd: %v", err)
+		return err
 	}
 	defer store.Close()
-
-	// Initialize container runtime
 	cr, err := runtime.NewContainerRuntime()
 	if err != nil {
-		log.Fatalf("Failed to initialize container runtime: %v", err)
+		return err
 	}
 	defer cr.Close()
-
-	// Register this node
-	ctx := context.Background()
-	node := &types.Node{
-		Metadata: types.ObjectMeta{
-			Name: *nodeName,
-			UID:  uuid.New().String(),
-		},
-		Status: types.NodeStatus{
-			Phase: types.NodeReady,
-			Ready: true,
-		},
-		Capacity: types.ResourceList{
-			"cpu":    "8",
-			"memory": "16000",
-		},
-		Allocatable: types.ResourceList{
-			"cpu":    "8",
-			"memory": "16000",
-		},
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
-		LastHeartbeat: time.Now(),
+	a := agent.Agent{Store: store, Runtime: cr, NodeName: name}
+	heartbeat := func() error {
+		c, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		capacity, err := cr.Capacity(c)
+		if err != nil {
+			return err
+		}
+		node, err := store.GetNode(c, name)
+		if errors.Is(err, storage.ErrNotFound) {
+			node = &types.Node{Metadata: types.ObjectMeta{Name: name, UID: uuid.NewString()}, CreatedAt: time.Now()}
+		} else if err != nil {
+			return err
+		}
+		node.Capacity = capacity
+		node.Allocatable = capacity
+		node.LastHeartbeat = time.Now()
+		node.UpdatedAt = time.Now()
+		node.Status = types.NodeStatus{Ready: true, Phase: types.NodeReady}
+		return store.SaveNode(c, node)
 	}
-
-	if err := store.SaveNode(ctx, node); err != nil {
-		log.Fatalf("Failed to register node: %v", err)
+	if err := heartbeat(); err != nil {
+		return err
 	}
-
-	log.Printf("Node registered: %s", *nodeName)
-
-	// Start heartbeat loop
-	ticker := time.NewTicker(10 * time.Second)
+	log.Printf("Node %s registered; reconciling managed containers", name)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-
+	beats := time.NewTicker(10 * time.Second)
+	defer beats.Stop()
+	// Keep heartbeats independent of slow image pulls.
+	done := make(chan struct{})
 	go func() {
-		for range ticker.C {
-			node.LastHeartbeat = time.Now()
-			store.SaveNode(ctx, node)
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-beats.C:
+				if err := heartbeat(); err != nil && ctx.Err() == nil {
+					log.Printf("heartbeat: %v", err)
+				}
+			}
 		}
 	}()
-
-	// Watch for pods scheduled on this node and run them
-	watchTicker := time.NewTicker(5 * time.Second)
-	defer watchTicker.Stop()
-
-	runningContainers := make(map[string]string) // pod -> container ID
-
-	for range watchTicker.C {
-		pods, err := store.ListPods(ctx, "default")
-		if err != nil {
-			log.Printf("Error listing pods: %v", err)
-			continue
+	defer func() { stop(); <-done }()
+	for {
+		c, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		err := a.Reconcile(c)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			log.Printf("agent: %v", err)
 		}
-
-		for _, pod := range pods {
-			// Check if pod is scheduled on this node
-			if pod.Spec.NodeName != *nodeName {
-				continue
-			}
-
-			podID := fmt.Sprintf("%s/%s", pod.Metadata.Namespace, pod.Metadata.Name)
-
-			// Skip if already running
-			if _, exists := runningContainers[podID]; exists {
-				continue
-			}
-
-			// Create and start containers
-			log.Printf("Starting pod %s on node %s", podID, *nodeName)
-
-			pod.Status.Phase = types.PodRunning
-			pod.Status.HostIP = "127.0.0.1"
-
-			for _, container := range pod.Spec.Containers {
-				containerID, err := cr.CreateContainer(ctx, pod, container)
-				if err != nil {
-					log.Printf("Error creating container: %v", err)
-					pod.Status.Phase = types.PodFailed
-					pod.Status.Message = fmt.Sprintf("Failed to create container: %v", err)
-					break
-				}
-
-				if err := cr.StartContainer(ctx, containerID); err != nil {
-					log.Printf("Error starting container: %v", err)
-					pod.Status.Phase = types.PodFailed
-					pod.Status.Message = fmt.Sprintf("Failed to start container: %v", err)
-					break
-				}
-
-				log.Printf("Container %s started", containerID)
-				runningContainers[podID] = containerID
-			}
-
-			// Update pod status
-			if err := store.SavePod(ctx, pod); err != nil {
-				log.Printf("Error updating pod status: %v", err)
-			}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
 		}
 	}
 }

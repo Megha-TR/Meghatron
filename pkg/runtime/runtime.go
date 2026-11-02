@@ -5,12 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Megha-TR/Meghatron/pkg/resources"
 	"log"
 	"os/exec"
-	"strconv"
 	"strings"
+	"time"
 
-	orch_types "github.com/orchestration-lite/core/pkg/types"
+	orch_types "github.com/Megha-TR/Meghatron/pkg/types"
 )
 
 // ContainerRuntime manages container operations via the Docker CLI.
@@ -29,7 +30,10 @@ var dockerLocations = []string{
 // findDocker returns the path to a working docker binary.
 func findDocker() (string, error) {
 	for _, path := range dockerLocations {
-		if err := exec.Command(path, "info").Run(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := exec.CommandContext(ctx, path, "info").Run()
+		cancel()
+		if err == nil {
 			return path, nil
 		}
 	}
@@ -56,7 +60,11 @@ func (cr *ContainerRuntime) CreateContainer(ctx context.Context, pod *orch_types
 	// Container name is scoped to namespace/pod/container to avoid collisions.
 	name := containerName(pod, containerSpec)
 
-	args := []string{"create", "--name", name}
+	args := []string{"create", "--name", name,
+		"--label", "meghatron.managed=true", "--label", "meghatron.node=" + pod.Spec.NodeName,
+		"--label", "meghatron.podUID=" + pod.Metadata.UID, "--label", "meghatron.container=" + containerSpec.Name,
+		"--label", "meghatron.namespace=" + pod.Metadata.Namespace,
+		"--label", "meghatron.pod=" + pod.Metadata.Name}
 
 	// Environment variables
 	for _, e := range containerSpec.Env {
@@ -69,25 +77,25 @@ func (cr *ContainerRuntime) CreateContainer(ctx context.Context, pod *orch_types
 		if proto == "" {
 			proto = "tcp"
 		}
-		args = append(args, "-p",
-			fmt.Sprintf("%d:%d/%s", p.ContainerPort, p.ContainerPort, strings.ToLower(proto)))
-	}
-
-	// Resource limits
-	if limits := containerSpec.Resources.Limits; limits != nil {
-		if cpuStr, ok := limits["cpu"]; ok {
-			args = append(args, "--cpus", cpuStr)
-		}
-		if memStr, ok := limits["memory"]; ok {
-			// treat as MiB
-			if memMiB, err := strconv.ParseInt(memStr, 10, 64); err == nil {
-				args = append(args, "--memory", fmt.Sprintf("%dm", memMiB))
-			}
+		args = append(args, "--expose", fmt.Sprintf("%d/%s", p.ContainerPort, strings.ToLower(proto)))
+		if p.HostPort != 0 {
+			args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:%d/%s", p.HostPort, p.ContainerPort, strings.ToLower(proto)))
 		}
 	}
 
-	// Restart policy
-	args = append(args, "--restart", toDockerRestartPolicy(containerSpec.RestartPolicy))
+	// Resource limits are normalized into Docker's cores and bytes.
+	limits, err := resources.Parse(containerSpec.Resources.Limits)
+	if err != nil {
+		return "", err
+	}
+	if limits.CPU > 0 {
+		args = append(args, "--cpus", fmt.Sprintf("%.3f", float64(limits.CPU)/1000))
+	}
+	if limits.Memory > 0 {
+		args = append(args, "--memory", fmt.Sprint(limits.Memory))
+	}
+	// The agent owns restart decisions and observes exits on the next pass.
+	args = append(args, "--restart", "no")
 
 	args = append(args, containerSpec.Image)
 
@@ -199,16 +207,67 @@ func (cr *ContainerRuntime) runDockerCommand(ctx context.Context, args ...string
 }
 
 func containerName(pod *orch_types.Pod, spec orch_types.Container) string {
-	return fmt.Sprintf("%s-%s-%s", pod.Metadata.Namespace, pod.Metadata.Name, spec.Name)
+	return fmt.Sprintf("meghatron-%s-%s", pod.Metadata.UID, spec.Name)
 }
 
-func toDockerRestartPolicy(policy orch_types.RestartPolicy) string {
-	switch policy {
-	case orch_types.RestartPolicyAlways:
-		return "always"
-	case orch_types.RestartPolicyOnFailure:
-		return "on-failure:3"
-	default:
-		return "no"
+// ManagedContainer carries stable ownership across agent process restarts.
+type ManagedContainer struct {
+	orch_types.ContainerStatus
+	PodUID        string
+	ContainerName string
+	ExitCode      int
+}
+
+func (cr *ContainerRuntime) ListContainers(ctx context.Context, nodeName string) ([]ManagedContainer, error) {
+	output, err := cr.runDockerCommand(ctx, "ps", "-aq", "--filter", "label=meghatron.managed=true", "--filter", "label=meghatron.node="+nodeName)
+	if err != nil {
+		return nil, err
 	}
+	ids := strings.Fields(output)
+	if len(ids) == 0 {
+		return []ManagedContainer{}, nil
+	}
+	args := append([]string{"inspect"}, ids...)
+	output, err = cr.runDockerCommand(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	var inspected []struct {
+		ID     string `json:"Id"`
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+		State struct {
+			Running  bool   `json:"Running"`
+			Status   string `json:"Status"`
+			ExitCode int    `json:"ExitCode"`
+		} `json:"State"`
+	}
+	if err := json.Unmarshal([]byte(output), &inspected); err != nil {
+		return nil, err
+	}
+	result := make([]ManagedContainer, 0, len(inspected))
+	for _, c := range inspected {
+		result = append(result, ManagedContainer{ContainerStatus: orch_types.ContainerStatus{ContainerID: c.ID, Running: c.State.Running, Ready: c.State.Running, State: c.State.Status}, PodUID: c.Config.Labels["meghatron.podUID"], ContainerName: c.Config.Labels["meghatron.container"], ExitCode: c.State.ExitCode})
+	}
+	return result, nil
+}
+
+// Capacity reports the Docker daemon's capacity, which may differ from its host.
+func (cr *ContainerRuntime) Capacity(ctx context.Context) (orch_types.ResourceList, error) {
+	output, err := cr.runDockerCommand(ctx, "info", "--format", "{{json .}}")
+	if err != nil {
+		return nil, err
+	}
+	var info struct {
+		NCPU     int64
+		MemTotal int64
+	}
+	if err := json.Unmarshal([]byte(output), &info); err != nil {
+		return nil, err
+	}
+	if info.NCPU <= 0 || info.MemTotal <= 0 {
+		return nil, fmt.Errorf("invalid Docker capacity")
+	}
+	return orch_types.ResourceList{"cpu": fmt.Sprintf("%dm", info.NCPU*1000), "memory": fmt.Sprintf("%dB", info.MemTotal)}, nil
 }

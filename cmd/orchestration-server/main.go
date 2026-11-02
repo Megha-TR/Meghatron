@@ -2,56 +2,64 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
-	"github.com/orchestration-lite/core/pkg/api"
-	"github.com/orchestration-lite/core/pkg/controller"
-	"github.com/orchestration-lite/core/pkg/scheduler"
-	"github.com/orchestration-lite/core/pkg/storage"
+	"github.com/Megha-TR/Meghatron/pkg/api"
+	"github.com/Megha-TR/Meghatron/pkg/controller"
+	"github.com/Megha-TR/Meghatron/pkg/scheduler"
+	"github.com/Megha-TR/Meghatron/pkg/storage"
 )
 
 func main() {
-	etcdEndpoint := flag.String("etcd", "localhost:2379", "etcd endpoint")
-	port := flag.String("port", "8080", "API server port")
+	endpoint := flag.String("etcd", "localhost:2379", "etcd endpoint")
+	listen := flag.String("listen", "127.0.0.1", "API bind address")
+	port := flag.String("port", "8080", "API port")
 	flag.Parse()
-
-	// Connect to etcd
-	log.Println("Connecting to etcd...")
-	store, err := storage.NewEtcdStorage([]string{*etcdEndpoint})
+	if err := run(*endpoint, *listen+":"+*port); err != nil {
+		log.Fatal(err)
+	}
+}
+func run(endpoint, address string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	store, err := storage.NewEtcdStorage([]string{endpoint})
 	if err != nil {
-		log.Fatalf("Failed to connect to etcd: %v", err)
+		return err
 	}
 	defer store.Close()
-
-	// Create scheduler
 	sched := scheduler.NewScheduler(store)
-
-	// Create API server
-	apiServer := api.NewServer(store, sched)
-
-	// Create and start deployment controller
-	deploymentController := controller.NewDeploymentController(store)
-	ctx, cancel := context.WithCancel(context.Background())
-	deploymentController.Run(ctx)
-
-	// Setup graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		log.Println("Shutting down...")
-		cancel()
-		deploymentController.Stop()
-		os.Exit(0)
-	}()
-
-	// Start API server
-	if err := apiServer.Listen(*port); err != nil {
-		log.Fatalf("Server error: %v", err)
+	dc := controller.NewDeploymentController(store)
+	var wg sync.WaitGroup
+	for _, run := range []func(context.Context){sched.Run, dc.Run} {
+		wg.Add(1)
+		go func(run func(context.Context)) { defer wg.Done(); run(ctx) }(run)
 	}
+	defer func() { stop(); wg.Wait() }()
+	server := &http.Server{Addr: address, Handler: api.NewServer(store, sched).Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-ctx.Done()
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(c); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+	}()
+	log.Printf("Meghatron API listening on %s", address)
+	err = server.ListenAndServe()
+	stop()
+	<-done
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }

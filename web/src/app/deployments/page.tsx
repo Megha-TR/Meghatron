@@ -1,9 +1,11 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import { fetchJSON } from '@/lib/api';
+import Modal from '@/components/Modal';
 
 interface DeploymentData {
-  metadata: { name: string; namespace: string; uid: string };
+  metadata: { name: string; namespace: string; uid: string; deletionTimestamp?: string };
   spec: { replicas: number; selector: Record<string, string> };
   status: { replicas: number; availableReplicas: number; updatedReplicas: number };
 }
@@ -24,21 +26,19 @@ export default function DeploymentsPage() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [deletingDep, setDeletingDep] = useState<string | null>(null);
+  const [scaling, setScaling] = useState<string | null>(null);
+  const [replicaEdits, setReplicaEdits] = useState<Record<string, number>>({});
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
-  const fetchDeployments = useCallback(async () => {
-    try {
-      const res = await fetch('/api/v1/deployments/default');
-      if (!res.ok) throw new Error(`API error: ${res.status}`);
-      const data = await res.json();
-      setDeployments(Array.isArray(data) ? data : []);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch deployments');
-    } finally {
-      setLoading(false);
-      setLastRefresh(new Date());
-    }
+  const fetchDeployments = useCallback(() => {
+    return fetchJSON<DeploymentData[]>('/api/v1/deployments/default')
+      .then(data => {
+        setDeployments(Array.isArray(data) ? data : []);
+        setError(null);
+        setLastRefresh(new Date());
+      })
+      .catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh deployments'))
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
@@ -99,9 +99,23 @@ export default function DeploymentsPage() {
     }
   };
 
+  const handleScale = async (name: string, replicas: number) => {
+    setScaling(name);
+    try {
+      const res = await fetch(`/api/v1/deployments/default/${encodeURIComponent(name)}/scale`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ replicas }),
+      });
+      if (!res.ok) { const body = await res.json(); throw new Error(body.error || 'Scaling failed'); }
+      await fetchDeployments();
+    } catch (err) { setError(err instanceof Error ? err.message : 'Scaling failed'); }
+    finally { setScaling(null); }
+  };
+
   const replicaHealth = (dep: DeploymentData) => {
+    if (dep.metadata.deletionTimestamp) return { label: 'Terminating', cls: 'text-amber-400' };
     const desired = dep.spec?.replicas ?? 0;
     const available = dep.status?.availableReplicas ?? 0;
+    if (desired === 0) return { label: 'Scaled to zero', cls: 'text-gray-400' };
     if (available === desired && desired > 0) return { label: 'Healthy', cls: 'text-green-400' };
     if (available === 0) return { label: 'Unavailable', cls: 'text-red-400' };
     return { label: 'Degraded', cls: 'text-yellow-400' };
@@ -110,12 +124,12 @@ export default function DeploymentsPage() {
   return (
     <div>
       {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex flex-wrap gap-4 items-center justify-between mb-8">
         <div>
           <h1 className="text-2xl font-bold text-white">Deployments</h1>
-          <p className="text-gray-400 mt-1 text-sm">Manage replica sets and rolling updates</p>
+          <p className="text-gray-400 mt-1 text-sm">Manage owned replicas, scaling and container cleanup</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2 bg-gray-800 rounded-lg px-3 py-2 border border-gray-700">
             <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
             <span className="text-xs text-gray-400">Auto-refresh 5s</span>
@@ -172,7 +186,7 @@ export default function DeploymentsPage() {
       )}
 
       {/* Table */}
-      <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+      <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-gray-700 bg-gray-900/50">
@@ -224,6 +238,15 @@ export default function DeploymentsPage() {
                   >
                     <td className="px-6 py-4">
                       <span className="font-mono text-gray-200 font-medium">{dep.metadata?.name}</span>
+                        {!dep.metadata.deletionTimestamp && <div className="flex items-center gap-2 mt-2">
+                          <input aria-label={`Desired replicas for ${dep.metadata.name}`} type="number" min={0} max={100}
+                            value={replicaEdits[dep.metadata.name] ?? dep.spec.replicas}
+                            onChange={e => setReplicaEdits(v => ({ ...v, [dep.metadata.name]: Number(e.target.value) }))}
+                            className="w-16 rounded bg-gray-900 border border-gray-600 px-2 py-1 text-xs" />
+                          <button onClick={() => handleScale(dep.metadata.name, replicaEdits[dep.metadata.name] ?? dep.spec.replicas)} disabled={scaling === dep.metadata.name}
+                            className="text-xs text-indigo-300 disabled:opacity-50">{scaling === dep.metadata.name ? 'Saving…' : 'Scale'}</button>
+                        </div>}
+
                       <p className="text-xs text-gray-500 mt-0.5">{dep.metadata?.namespace}</p>
                     </td>
                     <td className="px-6 py-4">
@@ -281,18 +304,17 @@ export default function DeploymentsPage() {
 
       {!loading && deployments.length > 0 && (
         <p className="text-xs text-gray-600 mt-3 text-right">
-          {deployments.length} deployment{deployments.length !== 1 ? 's' : ''} &middot; Last refreshed {lastRefresh.toLocaleTimeString()}
+          {deployments.length} deployment{deployments.length !== 1 ? 's' : ''} &middot; Last refreshed {lastRefresh?.toLocaleTimeString() ?? 'Never'}
         </p>
       )}
 
       {/* Create Deployment Modal */}
       {showCreate && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-800 rounded-xl border border-gray-700 w-full max-w-md shadow-2xl">
+        <Modal title="Create Deployment" onClose={() => { setShowCreate(false); setCreateError(null); }}>
             <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
               <h2 className="text-lg font-semibold text-white">Create Deployment</h2>
               <button onClick={() => { setShowCreate(false); setCreateError(null); }}
-                className="text-gray-400 hover:text-white transition-colors">
+                aria-label="Close dialog" className="text-gray-400 hover:text-white transition-colors">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -305,9 +327,10 @@ export default function DeploymentsPage() {
                 </div>
               )}
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">Deployment Name</label>
-                <input
+                <label htmlFor="deployments-deployment-name" className="block text-sm font-medium text-gray-300 mb-1.5">Deployment Name</label>
+                <input id="deployments-deployment-name"
                   type="text"
+                  pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?" maxLength={63}
                   value={form.name}
                   onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
                   placeholder="e.g. web-app"
@@ -316,8 +339,8 @@ export default function DeploymentsPage() {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">Container Image</label>
-                <input
+                <label htmlFor="deployments-container-image" className="block text-sm font-medium text-gray-300 mb-1.5">Container Image</label>
+                <input id="deployments-container-image"
                   type="text"
                   value={form.image}
                   onChange={e => setForm(f => ({ ...f, image: e.target.value }))}
@@ -327,19 +350,19 @@ export default function DeploymentsPage() {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">
+                <label htmlFor="deployment-replicas" className="block text-sm font-medium text-gray-300 mb-1.5">
                   Replicas: <span className="text-indigo-400 font-bold">{form.replicas}</span>
                 </label>
                 <input
-                  type="range"
-                  min={1}
+                  id="deployment-replicas" type="range"
+                  min={0}
                   max={10}
                   value={form.replicas}
                   onChange={e => setForm(f => ({ ...f, replicas: Number(e.target.value) }))}
                   className="w-full accent-indigo-500"
                 />
                 <div className="flex justify-between text-xs text-gray-500 mt-1">
-                  <span>1</span><span>10</span>
+                  <span>0</span><span>10</span>
                 </div>
               </div>
               <div className="pt-2 flex gap-3">
@@ -353,8 +376,7 @@ export default function DeploymentsPage() {
                 </button>
               </div>
             </form>
-          </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

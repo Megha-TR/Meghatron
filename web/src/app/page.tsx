@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
+import { fetchJSON } from '@/lib/api';
+import { formatCPU, formatMemory } from '@/lib/format';
 
 interface NodeData {
   metadata: { name: string; uid: string };
@@ -60,28 +62,20 @@ export default function OverviewPage() {
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
 
-  const fetchAll = useCallback(async () => {
-    try {
-      const [nodesRes, podsRes, deploymentsRes] = await Promise.all([
-        fetch('/api/v1/nodes'),
-        fetch('/api/v1/pods/default'),
-        fetch('/api/v1/deployments/default'),
-      ]);
-
-      const [nodesData, podsData, deploymentsData] = await Promise.all([
-        nodesRes.ok ? nodesRes.json() : [],
-        podsRes.ok ? podsRes.json() : [],
-        deploymentsRes.ok ? deploymentsRes.json() : [],
-      ]);
-
-      setNodes(Array.isArray(nodesData) ? nodesData : []);
-      setPods(Array.isArray(podsData) ? podsData : []);
-      setDeployments(Array.isArray(deploymentsData) ? deploymentsData : []);
+  const fetchAll = useCallback(() => {
+    return Promise.all([
+      fetchJSON<NodeData[]>('/api/v1/nodes'),
+      fetchJSON<PodData[]>('/api/v1/pods/default'),
+      fetchJSON<DeploymentData[]>('/api/v1/deployments/default'),
+    ]).then(([nodesData, podsData, deploymentsData]) => {
+      setNodes(nodesData);
+      setPods(podsData);
+      setDeployments(deploymentsData);
       setError(null);
       setLastRefresh(new Date());
-    } catch (err) {
-      setError('Failed to connect to API at localhost:8080');
-    }
+    }).catch(err => {
+      setError(err instanceof Error ? `${err.message}. Displaying the last successful snapshot.` : 'Unable to refresh cluster status.');
+    });
   }, []);
 
   useEffect(() => {
@@ -128,7 +122,7 @@ export default function OverviewPage() {
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-8">
         <StatCard
           title="Nodes"
-          value={nodes.length}
+          value={lastRefresh ? nodes.length : '—'}
           subtitle={`${readyNodes} ready / ${nodes.length - readyNodes} not ready`}
           href="/nodes"
           color="bg-blue-600/20"
@@ -141,7 +135,7 @@ export default function OverviewPage() {
         />
         <StatCard
           title="Pods"
-          value={pods.length}
+          value={lastRefresh ? pods.length : '—'}
           subtitle={`${runningPods} running / ${pendingPods} pending / ${failedPods} failed`}
           href="/pods"
           color="bg-purple-600/20"
@@ -154,7 +148,7 @@ export default function OverviewPage() {
         />
         <StatCard
           title="Deployments"
-          value={deployments.length}
+          value={lastRefresh ? deployments.length : '—'}
           subtitle={`${availableReplicas}/${totalReplicas} replicas available`}
           href="/deployments"
           color="bg-green-600/20"
@@ -167,7 +161,7 @@ export default function OverviewPage() {
         />
         <StatCard
           title="Cluster Health"
-          value={error ? 'Offline' : nodes.length === 0 ? 'Empty' : readyNodes === nodes.length ? 'Healthy' : 'Degraded'}
+          value={!lastRefresh && !error ? 'Loading' : error ? 'Unavailable' : nodes.length === 0 ? 'Empty' : readyNodes === nodes.length ? 'Healthy' : 'Degraded'}
           subtitle={error ? 'Cannot reach API' : `${readyNodes}/${nodes.length} nodes ready`}
           href="/nodes"
           color={error ? 'bg-red-600/20' : readyNodes === nodes.length && nodes.length > 0 ? 'bg-green-600/20' : 'bg-yellow-600/20'}
@@ -229,8 +223,8 @@ export default function OverviewPage() {
                     <span className="text-sm text-gray-300 font-mono">{node.metadata?.name}</span>
                   </div>
                   <div className="flex items-center gap-4 text-xs text-gray-500">
-                    <span>CPU: {node.capacity?.cpu || 'N/A'}</span>
-                    <span>Mem: {node.capacity?.memory || 'N/A'}</span>
+                    <span>CPU: {formatCPU(node.capacity?.cpu)}</span>
+                    <span>Mem: {formatMemory(node.capacity?.memory)}</span>
                     <span className={node.status?.ready ? 'text-green-400' : 'text-red-400'}>
                       {node.status?.ready ? 'Ready' : 'NotReady'}
                     </span>

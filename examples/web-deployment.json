@@ -21,7 +21,7 @@
         "containers": [
           {
             "name": "nginx",
-            "image": "nginx:1.24",
+            "image": "nginx:1.28-alpine",
             "ports": [
               {
                 "name": "http",
@@ -31,12 +31,12 @@
             ],
             "resources": {
               "requests": {
-                "cpu": "100",
-                "memory": "256"
+                "cpu": "100m",
+                "memory": "256Mi"
               },
               "limits": {
-                "cpu": "500",
-                "memory": "512"
+                "cpu": "500m",
+                "memory": "512Mi"
               }
             },
             "env": [

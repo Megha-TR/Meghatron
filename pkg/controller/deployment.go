@@ -4,129 +4,124 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
-	"github.com/orchestration-lite/core/pkg/storage"
-	"github.com/orchestration-lite/core/pkg/types"
+	"github.com/Megha-TR/Meghatron/pkg/scheduler"
+	"github.com/Megha-TR/Meghatron/pkg/storage"
+	"github.com/Megha-TR/Meghatron/pkg/types"
+	"github.com/google/uuid"
 )
 
-// DeploymentController reconciles deployment state
-type DeploymentController struct {
-	storage storage.Storage
-	ticker  *time.Ticker
-}
+type DeploymentController struct{ storage storage.Storage }
 
-// NewDeploymentController creates a new deployment controller
 func NewDeploymentController(store storage.Storage) *DeploymentController {
-	return &DeploymentController{
-		storage: store,
-		ticker:  time.NewTicker(5 * time.Second),
-	}
+	return &DeploymentController{storage: store}
 }
-
-// Run starts the deployment controller reconciliation loop
 func (dc *DeploymentController) Run(ctx context.Context) {
-	log.Println("Starting deployment controller")
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				dc.ticker.Stop()
-				return
-			case <-dc.ticker.C:
-				dc.reconcile(ctx)
-			}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := dc.Reconcile(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("deployment controller: %v", err)
 		}
-	}()
-}
-
-// reconcile reconciles deployment state
-func (dc *DeploymentController) reconcile(ctx context.Context) {
-	deployments, err := dc.storage.ListDeployments(ctx, "default")
-	if err != nil {
-		log.Printf("Error listing deployments: %v", err)
-		return
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
-
+}
+func (dc *DeploymentController) Reconcile(ctx context.Context) error {
+	deployments, err := dc.storage.ListDeployments(ctx, "")
+	if err != nil {
+		return err
+	}
 	for _, deployment := range deployments {
-		dc.reconcileDeployment(ctx, deployment)
-	}
-}
-
-// reconcileDeployment reconciles a single deployment
-func (dc *DeploymentController) reconcileDeployment(ctx context.Context, deployment *types.Deployment) {
-	// Get pods for this deployment
-	pods, err := dc.storage.ListPods(ctx, deployment.Metadata.Namespace)
-	if err != nil {
-		log.Printf("Error listing pods: %v", err)
-		return
-	}
-
-	// Filter pods by selector
-	var matchingPods []*types.Pod
-	for _, pod := range pods {
-		if dc.selectorMatches(deployment.Spec.Selector, pod.Metadata.Labels) {
-			matchingPods = append(matchingPods, pod)
+		if err := dc.reconcileDeployment(ctx, deployment); err != nil {
+			return err
 		}
 	}
-
-	currentReplicas := int32(len(matchingPods))
-	desiredReplicas := deployment.Spec.Replicas
-
-	log.Printf("Deployment %s/%s: current replicas=%d, desired=%d",
-		deployment.Metadata.Namespace, deployment.Metadata.Name,
-		currentReplicas, desiredReplicas)
-
-	// Scale up: create new pods
-	if currentReplicas < desiredReplicas {
-		needed := desiredReplicas - currentReplicas
-		for i := int32(0); i < needed; i++ {
-			pod := dc.createPodFromTemplate(deployment)
+	return nil
+}
+func (dc *DeploymentController) reconcileDeployment(ctx context.Context, d *types.Deployment) error {
+	pods, err := dc.storage.ListPods(ctx, d.Metadata.Namespace)
+	if err != nil {
+		return err
+	}
+	nodes, err := dc.storage.ListNodes(ctx)
+	if err != nil {
+		return err
+	}
+	fresh := map[string]bool{}
+	for _, n := range nodes {
+		fresh[n.Metadata.Name] = scheduler.Fresh(n)
+	}
+	isAvailable := func(p *types.Pod) bool { return types.Ready(p) && fresh[p.Spec.NodeName] }
+	owned := make([]*types.Pod, 0)
+	for _, pod := range pods {
+		if pod.Metadata.OwnerUID == d.Metadata.UID {
+			owned = append(owned, pod)
+		}
+	}
+	sort.Slice(owned, func(i, j int) bool { return owned[i].Metadata.Name < owned[j].Metadata.Name })
+	active := make([]*types.Pod, 0)
+	available := int32(0)
+	for _, pod := range owned {
+		if pod.Metadata.DeletionTimestamp != nil {
+			continue
+		}
+		if d.Metadata.DeletionTimestamp != nil || types.Terminal(pod) {
+			types.MarkDeleting(pod)
 			if err := dc.storage.SavePod(ctx, pod); err != nil {
-				log.Printf("Error creating pod: %v", err)
+				return err
+			}
+			continue
+		}
+		active = append(active, pod)
+		if isAvailable(pod) {
+			available++
+		}
+	}
+	if d.Metadata.DeletionTimestamp != nil {
+		if len(owned) == 0 {
+			return dc.storage.DeleteDeployment(ctx, d.Metadata.Namespace, d.Metadata.Name)
+		}
+		return nil
+	}
+	current := int32(len(active))
+	if current > d.Spec.Replicas {
+		for _, pod := range active[d.Spec.Replicas:] {
+			if isAvailable(pod) {
+				available--
+			}
+			types.MarkDeleting(pod)
+			if err := dc.storage.SavePod(ctx, pod); err != nil {
+				return err
 			}
 		}
+		current = d.Spec.Replicas
 	}
-
-	// Update deployment status
-	deployment.Status.Replicas = currentReplicas
-	deployment.Status.UpdatedReplicas = currentReplicas
-	deployment.Status.AvailableReplicas = currentReplicas
-
-	if err := dc.storage.SaveDeployment(ctx, deployment); err != nil {
-		log.Printf("Error updating deployment status: %v", err)
-	}
-}
-
-// selectorMatches checks if labels match the selector
-func (dc *DeploymentController) selectorMatches(selector, labels map[string]string) bool {
-	for k, v := range selector {
-		if labels[k] != v {
-			return false
+	for i := current; i < d.Spec.Replicas; i++ {
+		pod := dc.createPodFromTemplate(d)
+		if err := dc.storage.SavePod(ctx, pod); err != nil {
+			return err
 		}
+		current++
 	}
-	return true
+	d.Status.Replicas = current
+	d.Status.UpdatedReplicas = current
+	d.Status.AvailableReplicas = available
+	d.UpdatedAt = time.Now()
+	return dc.storage.SaveDeployment(ctx, d)
 }
-
-// createPodFromTemplate creates a pod from the deployment template
-func (dc *DeploymentController) createPodFromTemplate(deployment *types.Deployment) *types.Pod {
-	pod := &types.Pod{
-		Metadata: types.ObjectMeta{
-			Name:      fmt.Sprintf("%s-%d", deployment.Metadata.Name, time.Now().UnixNano()),
-			Namespace: deployment.Metadata.Namespace,
-			Labels:    deployment.Spec.Template.Metadata.Labels,
-		},
-		Spec:      deployment.Spec.Template.Spec,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+func (dc *DeploymentController) createPodFromTemplate(d *types.Deployment) *types.Pod {
+	now := time.Now()
+	id := uuid.New().String()
+	// JSON templates contain maps/slices; storage serialization isolates each copy.
+	name := d.Metadata.Name
+	if len(name) > 50 {
+		name = name[:50]
 	}
-
-	pod.Status.Phase = types.PodPending
-	return pod
-}
-
-// Stop stops the deployment controller
-func (dc *DeploymentController) Stop() {
-	dc.ticker.Stop()
+	return &types.Pod{Metadata: types.ObjectMeta{Name: fmt.Sprintf("%s-%s", name, id[:8]), Namespace: d.Metadata.Namespace, UID: id, OwnerUID: d.Metadata.UID, Labels: d.Spec.Template.Metadata.Labels}, Spec: d.Spec.Template.Spec, Status: types.PodStatus{Phase: types.PodPending}, CreatedAt: now, UpdatedAt: now}
 }

@@ -4,155 +4,178 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
+	"sync"
+	"time"
 
-	"github.com/orchestration-lite/core/pkg/storage"
-	"github.com/orchestration-lite/core/pkg/types"
+	"github.com/Megha-TR/Meghatron/pkg/resources"
+	"github.com/Megha-TR/Meghatron/pkg/storage"
+	"github.com/Megha-TR/Meghatron/pkg/types"
 )
 
-// Scheduler is responsible for assigning pods to nodes
+const HeartbeatTimeout = 30 * time.Second
+
+// One scheduler is supported per cluster. The mutex serializes local reservations;
+// etcd revisions prevent stale writes from resurrecting deleted or changed pods.
 type Scheduler struct {
 	storage storage.Storage
+	mu      sync.Mutex
 }
 
-// NewScheduler creates a new scheduler instance
-func NewScheduler(store storage.Storage) *Scheduler {
-	return &Scheduler{storage: store}
+func NewScheduler(store storage.Storage) *Scheduler { return &Scheduler{storage: store} }
+func Fresh(node *types.Node) bool {
+	return node.Status.Ready && time.Since(node.LastHeartbeat) < HeartbeatTimeout && !node.LastHeartbeat.IsZero()
 }
-
-// Schedule assigns a pod to a suitable node
-func (s *Scheduler) Schedule(ctx context.Context, pod *types.Pod) error {
-	// Get all nodes
+func (s *Scheduler) Run(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		if err := s.Reconcile(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("scheduler: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+func (s *Scheduler) Reconcile(ctx context.Context) error {
 	nodes, err := s.storage.ListNodes(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list nodes: %w", err)
+		return err
 	}
-
-	if len(nodes) == 0 {
-		return fmt.Errorf("no nodes available for scheduling")
+	freshNodes := map[string]bool{}
+	for _, node := range nodes {
+		freshNodes[node.Metadata.Name] = Fresh(node)
+		if node.Status.Ready && !Fresh(node) {
+			node.Status.Ready = false
+			node.Status.Phase = types.NodeNotReady
+			node.Status.Message = "Heartbeat expired"
+			if err := s.storage.SaveNode(ctx, node); err != nil {
+				log.Printf("node health: %v", err)
+			}
+		}
 	}
-
-	// Find the best node using bin-packing algorithm
-	selectedNode := s.findBestNode(ctx, nodes, pod)
-	if selectedNode == nil {
-		return fmt.Errorf("no suitable node found for pod %s/%s", pod.Metadata.Namespace, pod.Metadata.Name)
+	pods, err := s.storage.ListPods(ctx, "")
+	if err != nil {
+		return err
 	}
-
-	// Assign pod to node
-	pod.Spec.NodeName = selectedNode.Metadata.Name
-	pod.Status.Phase = types.PodPending
-
-	// Save updated pod
-	if err := s.storage.SavePod(ctx, pod); err != nil {
-		return fmt.Errorf("failed to save pod: %w", err)
+	for _, pod := range pods {
+		if pod.Spec.NodeName != "" {
+			if !freshNodes[pod.Spec.NodeName] && pod.Metadata.DeletionTimestamp == nil && !types.Terminal(pod) {
+				pod.Status.Phase = types.PodUnknown
+				pod.Status.Message = "Assigned worker heartbeat expired or worker missing"
+				if err := s.storage.SavePod(ctx, pod); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if pod.Metadata.DeletionTimestamp != nil {
+			if err := s.storage.DeletePod(ctx, pod.Metadata.Namespace, pod.Metadata.Name); err != nil {
+				return err
+			}
+			continue
+		}
+		if types.Terminal(pod) {
+			continue
+		}
+		if err := s.Schedule(ctx, pod); err != nil {
+			pod.Status.Message = err.Error()
+			pod.UpdatedAt = time.Now()
+			if err := s.storage.SavePod(ctx, pod); err != nil {
+				log.Printf("pending status: %v", err)
+			}
+		}
 	}
-
-	log.Printf("Pod %s/%s scheduled on node %s", pod.Metadata.Namespace, pod.Metadata.Name, selectedNode.Metadata.Name)
 	return nil
 }
-
-// findBestNode implements a bin-packing algorithm to find the best node for a pod
-func (s *Scheduler) findBestNode(ctx context.Context, nodes []*types.Node, pod *types.Pod) *types.Node {
-	var bestNode *types.Node
-	minWaste := float64(1<<63 - 1) // Max float
-
-	podResources := s.getPodResources(pod)
-
-	for _, node := range nodes {
-		// Skip unhealthy nodes
-		if !node.Status.Ready {
-			continue
-		}
-
-		// Check if node has enough resources
-		if !s.hasEnoughResources(node, podResources) {
-			continue
-		}
-
-		// Calculate waste (bin-packing)
-		waste := s.calculateWaste(node, podResources)
-		if waste < minWaste {
-			minWaste = waste
-			bestNode = node
-		}
+func (s *Scheduler) Schedule(ctx context.Context, pod *types.Pod) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pod.Spec.NodeName != "" || pod.Metadata.DeletionTimestamp != nil {
+		return nil
 	}
-
-	return bestNode
-}
-
-// getPodResources extracts resource requests from a pod
-func (s *Scheduler) getPodResources(pod *types.Pod) map[string]int64 {
-	resources := make(map[string]int64)
-	resources["cpu"] = 0
-	resources["memory"] = 0
-
-	for _, container := range pod.Spec.Containers {
-		if container.Resources.Requests != nil {
-			if cpu, ok := container.Resources.Requests["cpu"]; ok {
-				resources["cpu"] += parseResource(cpu)
-			}
-			if mem, ok := container.Resources.Requests["memory"]; ok {
-				resources["memory"] += parseResource(mem)
-			}
-		}
-	}
-
-	return resources
-}
-
-// hasEnoughResources checks if a node has enough resources for a pod
-func (s *Scheduler) hasEnoughResources(node *types.Node, podResources map[string]int64) bool {
-	nodeAllocatable := node.Allocatable
-
-	if cpu, ok := podResources["cpu"]; ok {
-		if nodeCPU, ok := nodeAllocatable["cpu"]; ok {
-			if parseResource(nodeCPU) < cpu {
-				return false
-			}
-		}
-	}
-
-	if mem, ok := podResources["memory"]; ok {
-		if nodeMem, ok := nodeAllocatable["memory"]; ok {
-			if parseResource(nodeMem) < mem {
-				return false
-			}
-		}
-	}
-
-	return true
-}
-
-// calculateWaste calculates resource waste when assigning a pod to a node
-func (s *Scheduler) calculateWaste(node *types.Node, podResources map[string]int64) float64 {
-	nodeAllocatable := node.Allocatable
-
-	cpuWaste := float64(0)
-	if cpu, ok := podResources["cpu"]; ok {
-		if nodeCPU, ok := nodeAllocatable["cpu"]; ok {
-			nodeCapacity := parseResource(nodeCPU)
-			cpuWaste = float64(nodeCapacity-cpu) / float64(nodeCapacity)
-		}
-	}
-
-	memWaste := float64(0)
-	if mem, ok := podResources["memory"]; ok {
-		if nodeMem, ok := nodeAllocatable["memory"]; ok {
-			nodeCapacity := parseResource(nodeMem)
-			memWaste = float64(nodeCapacity-mem) / float64(nodeCapacity)
-		}
-	}
-
-	return (cpuWaste + memWaste) / 2
-}
-
-// parseResource converts a resource string to int64
-func parseResource(resource string) int64 {
-	// Simple parser for resource values
-	// In production, this would handle units like "100m", "1Gi", etc.
-	var value int64
-	_, err := fmt.Sscanf(resource, "%d", &value)
+	nodes, err := s.storage.ListNodes(ctx)
 	if err != nil {
-		return 0
+		return err
 	}
-	return value
+	pods, err := s.storage.ListPods(ctx, "")
+	if err != nil {
+		return err
+	}
+	need, err := resources.Requests(pod)
+	if err != nil {
+		return err
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Metadata.Name < nodes[j].Metadata.Name })
+	var best *types.Node
+	bestScore := float64(3)
+	for _, node := range nodes {
+		if !Fresh(node) {
+			continue
+		}
+		capacity, err := resources.Parse(node.Allocatable)
+		if err != nil || capacity.CPU == 0 || capacity.Memory == 0 {
+			continue
+		}
+		available := capacity
+		portConflict := false
+		for _, assigned := range pods {
+			if assigned.Spec.NodeName != node.Metadata.Name || assigned.Metadata.UID == pod.Metadata.UID {
+				continue
+			}
+			// Reserve even terminal pods until the agent has cleaned their containers.
+			used, err := resources.Requests(assigned)
+			if err != nil {
+				return err
+			}
+			available = available.Sub(used)
+			if hostPortsConflict(pod, assigned) {
+				portConflict = true
+			}
+		}
+		if !available.Fits(need) || portConflict {
+			continue
+		}
+		remaining := available.Sub(need)
+		score := float64(remaining.CPU)/float64(capacity.CPU) + float64(remaining.Memory)/float64(capacity.Memory)
+		if score < bestScore {
+			best = node
+			bestScore = score
+		}
+	}
+	if best == nil {
+		return fmt.Errorf("no healthy node has sufficient CPU, memory and host ports")
+	}
+	pod.Spec.NodeName = best.Metadata.Name
+	pod.Status.Phase = types.PodPending
+	pod.Status.Message = ""
+	pod.UpdatedAt = time.Now()
+	return s.storage.SavePod(ctx, pod)
+}
+func hostPortsConflict(a, b *types.Pod) bool {
+	for _, ca := range a.Spec.Containers {
+		for _, pa := range ca.Ports {
+			if pa.HostPort == 0 {
+				continue
+			}
+			for _, cb := range b.Spec.Containers {
+				for _, pb := range cb.Ports {
+					ap, bp := pa.Protocol, pb.Protocol
+					if ap == "" {
+						ap = "TCP"
+					}
+					if bp == "" {
+						bp = "TCP"
+					}
+					if pa.HostPort == pb.HostPort && ap == bp {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }

@@ -1,306 +1,163 @@
-# Meghatron — Container Orchestration
+# Meghatron
 
-A lightweight Kubernetes-like container orchestration system built from scratch in Go, with a full-stack web dashboard. This project demonstrates distributed systems concepts including scheduling, resource management, controller reconciliation, and container lifecycle management.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## What It Does
+A container orchestration system built in Go, with an etcd control plane, Docker worker agents, a CLI, and a Next.js dashboard. Meghatron demonstrates how desired-state reconciliation, resource scheduling, ownership, and recovery fit together behind a Kubernetes-style API.
 
-You have apps (packaged as Docker containers) and servers. This system is the traffic controller that:
+**Portfolio / learning project.** Designed for a trusted local lab, with one control-plane process and one worker agent per Docker daemon. It is not a production Kubernetes replacement.
 
-- Decides **which server runs which container** (bin-packing scheduler)
-- **Pulls images and starts containers** automatically via Docker
-- Keeps the **right number of replicas** running (deployment controller)
-- Lets you manage everything from a **CLI, REST API, or web dashboard**
+![Meghatron dashboard with three real nginx replicas](docs/images/dashboard.png)
 
-It is a simplified version of Kubernetes built from scratch to demonstrate how orchestration systems work internally.
+## What works
 
----
+- **Desired-state deployments:** create replicas, scale up/down, replace terminal replicas, and delete owned pods with container cleanup.
+- **Resource-aware scheduling:** filter fresh workers by remaining CPU/memory and explicit host-port reservations, then use a deterministic best-fit score. Pending pods retry when capacity becomes available.
+- **Restart recovery:** discover containers using stable Docker ownership labels, adopt them after an agent restart, and apply `Always`, `OnFailure`, or `Never` restart policies.
+- **Consistent state:** etcd compare-and-swap writes reject duplicate creates and stale updates. Deletion intent remains persisted until container cleanup succeeds.
+- **Observed status:** availability requires all containers to be observed running. Workers with heartbeats older than 30 seconds are excluded from new scheduling.
+- **Management interfaces:** REST API, API-only CLI, and a responsive dashboard with creation, scaling, deletion, and actionable pod errors.
+- **Verification:** race-enabled behavioral tests, an isolated real-Docker lifecycle test, and a prepared GitHub Actions workflow.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────┐
-│         Web Dashboard (Next.js)         │
-│  • Overview, Nodes, Pods, Deployments   │
-│  • Create / delete resources via UI     │
-│  • Auto-refreshes every 5 seconds       │
-└─────────────────────────────────────────┘
-              ↓ (HTTP proxy :3000 → :8080)
-┌─────────────────────────────────────────┐
-│      Orchestration Server (Master)      │
-├─────────────────────────────────────────┤
-│  • REST API Server (chi router)         │
-│  • Scheduler (bin-packing algorithm)    │
-│  • Deployment Controller                │
-│  • etcd integration for state storage   │
-└─────────────────────────────────────────┘
-              ↓ (HTTP / etcd)
-┌─────────────────────────────────────────┐
-│      Node Agent (Worker Node)           │
-├─────────────────────────────────────────┤
-│  • Registers with master                │
-│  • Polls for scheduled pods (5s loop)   │
-│  • Pulls Docker images                  │
-│  • Creates and starts containers        │
-│  • Sends heartbeats every 10s           │
-└─────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    UI[Next.js dashboard] -->|same-origin API proxy| API[Go REST API]
+    CLI[orc CLI] --> API
+    API --> ETCD[(etcd: desired and observed state)]
+    S[Scheduler: 1-second reconciliation] <--> ETCD
+    C[Deployment controller: 2-second reconciliation] <--> ETCD
+    A[Worker agent: 2-second reconciliation] <--> ETCD
+    A -->|inspect / create / start / remove| D[Docker daemon]
+    A -->|heartbeat every 10 seconds| ETCD
 ```
 
-### Request Flow (pod create)
+A deployment creates pods with a stable owner UID. The scheduler assigns unbound pods to eligible workers. Each worker compares assigned pods against labeled Docker containers, performs missing lifecycle actions, and records observed status. Deletion marks intent first; the worker removes containers before removing the pod record. The controller removes a terminating deployment only after its owned pods are gone.
 
-```
-orc pod create nginx nginx:latest
-        │
-        ▼
-POST /api/v1/pods  (orchestration-server :8080)
-        │
-        ▼
-Scheduler: finds best node via bin-packing
-        │
-        ▼
-Saves pod with NodeName=worker-1 to etcd
-        │
-        ▼
-Node agent polls etcd, sees pod assigned to it
-        │
-        ▼
-Pulls nginx:latest → docker create → docker start
-        │
-        ▼
-Container running, pod phase updated to Running
-        │
-        ▼
-Dashboard auto-refreshes and shows Running status
-```
+See [design decisions and failure behavior](docs/architecture.md).
 
----
+## Run locally
 
-## Project Structure
-
-```
-project/
-├── cmd/
-│   ├── orchestration-server/    # Master API server entry point
-│   ├── node-agent/              # Worker node agent entry point
-│   └── cli/                     # orc CLI tool entry point
-├── pkg/
-│   ├── api/                     # REST API handlers (chi router)
-│   ├── scheduler/               # Bin-packing scheduling algorithm
-│   ├── controller/              # Deployment reconciliation loop
-│   ├── storage/                 # etcd storage layer (CRUD for all resources)
-│   ├── runtime/                 # Docker container runtime (CLI-based)
-│   └── types/                   # Core data types (Pod, Node, Deployment, etc.)
-├── web/                         # Next.js + Tailwind web dashboard
-│   ├── src/app/                 # Pages: overview, nodes, pods, deployments
-│   └── src/components/          # Sidebar, StatusBadge
-├── bin/                         # Compiled binaries (after build, gitignored)
-├── go.mod
-└── README.md
-```
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Backend language | Go 1.21+ |
-| HTTP router | go-chi/chi v5 |
-| State store | etcd v3.5 |
-| Container runtime | Docker (via CLI) |
-| CLI framework | urfave/cli v2 |
-| Frontend | Next.js 14 + React 18 |
-| Styling | Tailwind CSS |
-| ID generation | google/uuid |
-
----
-
-## Requirements
-
-- **Go 1.21+** — `go version`
-- **Node.js 18+** — `node --version`
-- **Docker Desktop** — must be open and running
-- **etcd** — runs inside Docker, no separate install needed
-
----
-
-## Full Setup — Run Everything From Scratch
-
-### Step 1 — Open Docker Desktop
-
-On macOS: press Cmd+Space, type Docker, hit Enter. Wait for the whale icon in the menu bar to stop animating.
-
-### Step 2 — Start etcd
-
-**First time:**
-```bash
-docker run -d --name etcd \
-  -p 2379:2379 \
-  -e ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379 \
-  -e ETCD_ADVERTISE_CLIENT_URLS=http://127.0.0.1:2379 \
-  quay.io/coreos/etcd:v3.5.0
-```
-
-**After first time:**
-```bash
-docker start etcd
-```
-
-### Step 3 — Build the Go binaries
+Requirements: **Go 1.25+**, **Node.js 22.13+**, npm, Docker with Compose, and `make`. The scripted demo also needs `curl` and `jq`.
 
 ```bash
-cd /path/to/project
-go mod download
-go build -o bin/orchestration-server ./cmd/orchestration-server
-go build -o bin/node-agent ./cmd/node-agent
-go build -o bin/orc ./cmd/cli
+git clone https://github.com/Megha-TR/Meghatron.git
+cd Meghatron
+make etcd-up
+make build
+cd web
+npm ci
+cd ..
 ```
 
-### Step 4 — Install dashboard dependencies
+Run these in three terminals from the repository root:
 
 ```bash
-cd web && npm install && cd ..
-```
+# Terminal 1 — control plane (loopback only by default)
+./bin/orchestration-server
 
-### Step 5 — Start everything (4 terminals)
+# Terminal 2 — worker (capacity is detected from its Docker daemon)
+./bin/node-agent --node-name worker-1
 
-**Terminal 1 — orchestration server:**
-```bash
-./bin/orchestration-server --port 8080 --etcd localhost:2379
-```
-
-**Terminal 2 — node agent:**
-```bash
-./bin/node-agent --node-name worker-1 --etcd localhost:2379
-```
-
-**Terminal 3 — web dashboard:**
-```bash
+# Terminal 3 — dashboard
 cd web && npm run dev
 ```
 
-**Terminal 4 — CLI:**
-```bash
-./bin/orc node list
-```
-
----
-
-## How to Test It's Working
-
-### Web Dashboard
-
-Open **http://localhost:3000** — you should see the Meghatron dashboard with live node/pod/deployment data.
-
-### CLI
+Open [the dashboard](http://localhost:3000). The dashboard currently shows the `default` namespace; the API, scheduler, controller, worker and CLI support other namespaces.
 
 ```bash
-# List nodes
-./bin/orc node list
-
-# Create a pod
-./bin/orc pod create nginx nginx:latest
-
-# Check pod is running
+./bin/orc deployment create web nginx:1.28-alpine 3
+./bin/orc deployment get web
 ./bin/orc pod list
-
-# Confirm Docker ran it
-docker ps
-
-# Create a deployment with 3 replicas
-./bin/orc deployment create web-app nginx:latest 3
-
-# Delete a pod
-./bin/orc pod delete nginx
+./bin/orc deployment scale web 1
+./bin/orc deployment delete web
 ```
 
-### REST API
+Deletion is asynchronous. A terminating resource remains visible until the worker finishes cleanup. Containers intentionally stay running when an agent process stops; restarting that agent adopts them.
+
+### Five-minute demonstration
+
+With the control plane and worker running:
 
 ```bash
-# Health check
-curl http://localhost:8080/health
-
-# List nodes
-curl http://localhost:8080/api/v1/nodes
-
-# Create a pod
-curl -X POST http://localhost:8080/api/v1/pods \
-  -H "Content-Type: application/json" \
-  -d '{
-    "metadata": {"name": "my-pod", "namespace": "default"},
-    "spec": {
-      "containers": [{"name": "app", "image": "nginx:latest"}]
-    }
-  }'
-
-# Delete a pod
-curl -X DELETE http://localhost:8080/api/v1/pods/default/my-pod
+make demo
 ```
 
----
+The script creates a uniquely named deployment, waits for three available nginx replicas, scales to one, then deletes it and waits for cleanup. Watch the dashboard during the run. It does not delete unrelated workloads.
 
-## Troubleshooting
+To demonstrate recovery manually, create a deployment, restart only its node agent, and verify the same container IDs remain. Stop one of its containers with `docker stop <container-id>` and observe the agent restart it on its next reconciliation.
 
-**etcd connection refused:**
+## Resource and port semantics
+
+CPU accepts cores (`"0.5"`, `"1"`) or millicores (`"100m"`). Memory accepts `Ki`, `Mi`, `Gi`, decimal `K/M/G`, and bytes with `B`. Bare memory numbers retain the original MiB convention. Internally, CPU uses millicores and memory uses bytes.
+
+Each container defaults to requests of `100m` CPU / `64Mi` memory and limits of `1` CPU / `256Mi` memory. A request must not exceed its limit. Scheduling reserves requests across all assigned pods; Docker enforces limits. Allocatable capacity currently equals Docker-reported capacity without a host-system reserve.
+
+A `containerPort` documents/exposes a port inside Docker; it does **not** publish a host port. An optional `hostPort` publishes to loopback and is reserved by the scheduler. For example:
+
+```json
+{"name":"app","image":"nginx:1.28-alpine","ports":[{"containerPort":80,"hostPort":8081}]}
+```
+
+This container is reachable at [localhost:8081](http://localhost:8081). Replicas can share container port 80, but cannot share the same host port and protocol on one worker. Service networking is not implemented; service creation returns `501` rather than a nonfunctional IP.
+
+## API
+
+| Operation | Endpoint |
+| --- | --- |
+| Create pod | `POST /api/v1/pods` |
+| List / inspect / delete pod | `GET /api/v1/pods/{namespace}`, `GET` / `DELETE /api/v1/pods/{namespace}/{name}` |
+| List / inspect workers | `GET /api/v1/nodes`, `GET /api/v1/nodes/{name}` |
+| Create deployment | `POST /api/v1/deployments` |
+| List / inspect / delete deployment | `GET /api/v1/deployments/{namespace}`, `GET` / `DELETE /api/v1/deployments/{namespace}/{name}` |
+| Scale deployment | `PATCH /api/v1/deployments/{namespace}/{name}/scale` with `{"replicas": 2}` |
+| Liveness / storage readiness | `GET /health`, `GET /ready` |
+
 ```bash
-docker start etcd
+curl -fsS http://127.0.0.1:8080/api/v1/deployments \
+  -H 'Content-Type: application/json' \
+  -d @examples/web-deployment.json
 ```
 
-**Docker binary not found (node agent error):**
-Docker Desktop must be open. The runtime auto-checks these paths:
-`docker` → `/usr/local/bin/docker` → `/usr/bin/docker` → `/Applications/Docker.app/Contents/Resources/bin/docker`
+Creates return `201`, deletion requests `202`, invalid input `400`, missing resources `404`, duplicate/stale writes `409`, storage failures `503`, and non-JSON write bodies `415`. Public create operations generate server-owned IDs, timestamps and status; clients cannot choose assignment or ownership.
 
-**Pod stuck in Pending:**
-Node agent must be running. Check its terminal for errors.
+The CLI uses only the API. Set `--server` / `MEGHATRON_SERVER` for a different API and `--namespace team-a` for another namespace (global flags precede commands). Set `MEGHATRON_API_URL` before starting/building the dashboard to change its API proxy target.
 
-**Container name conflict on restart:**
+## Checks
+
 ```bash
-docker rm -f default-nginx-nginx
-```
-Node agent recreates it within 5 seconds.
-
-**Dashboard shows 0s:**
-```bash
-curl http://localhost:8080/health   # server must be running
+make check          # formatting, go vet, race-enabled Go tests
+make build          # all three binaries
+make coverage       # coverage for the six core behavioral packages
+make web-check      # TypeScript, ESLint, production Next.js build (after npm ci)
+make e2e            # temporary etcd + real Docker deployment/recovery/scale/delete
 ```
 
----
+`make e2e` uses a random loopback etcd port and unique container ownership labels. It cleans up its containers and etcd instance on exit. It needs Docker access and image registry access on the first run. Ordinary `go test ./...` skips this integration test unless `MEGHATRON_TEST_ETCD` is set.
 
-## Core Components
+The [GitHub Actions workflow template](docs/ci-workflow.yml) runs backend checks, dashboard checks and dependency auditing, and the real-container lifecycle test. To enable it, add its contents as `.github/workflows/ci.yml` through GitHub or credentials with workflow permission. The credentials used to publish this update cannot create workflow files, so hosted CI is not enabled yet.
 
-### Scheduler (`pkg/scheduler/`)
-Bin-packing algorithm — filters nodes by available CPU/memory, picks the one with minimum waste.
+## Scope and tradeoffs
 
-### Deployment Controller (`pkg/controller/`)
-Reconciliation loop every 5 seconds — compares desired vs actual replicas, creates pods to fill the gap.
+- One active scheduler/controller process is supported. Local serialization plus etcd version checks does not provide distributed leader election or transactional cluster-wide resource reservations.
+- A lost worker becomes NotReady. Its pods are **not** automatically moved: safe failover needs fencing to avoid duplicate execution on a partitioned worker. Cleanup waits for that worker to return.
+- Readiness means Docker reports every container running; there are no application liveness/readiness probes, restart backoff, or rolling image updates.
+- Containers within a pod do not share a network namespace. There is no overlay network, Service routing, DNS, volumes, secrets, or RBAC.
+- API and etcd are unauthenticated. Defaults bind exposed ports to loopback; do not expose this stack to untrusted networks. Docker access is privileged.
+- Reconciliation uses polling/full lists rather than etcd watches. Scale/performance claims require a separate benchmark.
+- Old unlabeled containers and old deployment pods from the original prototype are not adopted automatically. Use a fresh demo state or explicitly remove only your old prototype resources before switching versions.
 
-### Container Runtime (`pkg/runtime/`)
-Wraps Docker CLI via `os/exec` — auto-detects Docker binary, pulls images on demand, scopes container names as `{namespace}-{pod}-{container}`.
+See [local verification results](docs/validation.md) and [portfolio notes](docs/portfolio.md) for résumé bullets and interview talking points grounded in the implementation.
 
-### Storage (`pkg/storage/`)
-etcd-backed with hierarchical keys: `/pods/{namespace}/{name}`, `/nodes/{name}`, `/deployments/{namespace}/{name}`.
+## Troubleshooting and cleanup
 
-### Web Dashboard (`web/`)
-Next.js 14 + Tailwind — 4 pages (Overview, Nodes, Pods, Deployments), create/delete from UI, auto-refreshes every 5s, proxies API via Next.js rewrites.
+- **Pending pod:** inspect its message on the Pods page. Check for a ready worker, insufficient capacity, host-port conflicts, image pull failures, or Docker errors.
+- **Terminating pod:** its worker must be reachable and able to remove Docker containers. Records remain until cleanup succeeds.
+- **API unavailable:** check `/health` and `/ready`; `docker compose logs etcd` shows storage errors. Dashboard fetch errors preserve the last successful snapshot.
+- **Docker unavailable:** start Docker and check `docker info`. Use a distinct daemon for each worker agent; two agents on one daemon would misrepresent capacity.
 
----
-
-## Known Limitations
-
-- No scale-down — deployment controller scales up only
-- Pod deletion does not stop the Docker container
-- No health checks (liveness/readiness probes)
-- No service discovery or DNS
-- No authentication on the API
-- No rolling updates
-
----
-
-## Security Notice
-
-This is a learning/portfolio project. Do not use in production without authentication, TLS, resource isolation, and audit logging.
-
----
+Delete your deployments/pods and wait for cleanup before stopping the agents. `make etcd-down` stops etcd while retaining its data volume. Do not remove the etcd data volume while managed workloads remain running.
 
 ## License
 
-MIT License
+[MIT](LICENSE)

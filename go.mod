@@ -1,4 +1,4 @@
-module github.com/orchestration-lite/core
+module github.com/Megha-TR/Meghatron
 
 go 1.25.0
 

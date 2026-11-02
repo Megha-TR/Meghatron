@@ -3,13 +3,17 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
 
-	"github.com/orchestration-lite/core/pkg/types"
+	"github.com/Megha-TR/Meghatron/pkg/types"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// Storage interface defines methods for storing and retrieving cluster resources
+var ErrNotFound = errors.New("resource not found")
+var ErrConflict = errors.New("resource already exists or was changed; retry with the latest version")
+
 type Storage interface {
 	SavePod(ctx context.Context, pod *types.Pod) error
 	GetPod(ctx context.Context, namespace, name string) (*types.Pod, error)
@@ -34,265 +38,217 @@ type Storage interface {
 	Close() error
 }
 
-// EtcdStorage implements Storage using etcd as the backend
-type EtcdStorage struct {
-	client *clientv3.Client
-}
+type EtcdStorage struct{ client *clientv3.Client }
 
-// NewEtcdStorage creates a new EtcdStorage instance
 func NewEtcdStorage(endpoints []string) (*EtcdStorage, error) {
-	client, err := clientv3.New(clientv3.Config{
-		Endpoints: endpoints,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create etcd client: %w", err)
-	}
-
-	return &EtcdStorage{client: client}, nil
-}
-
-// Helper functions
-func (es *EtcdStorage) podKey(namespace, name string) string {
-	return fmt.Sprintf("/orchestration/pods/%s/%s", namespace, name)
-}
-
-func (es *EtcdStorage) nodeKey(name string) string {
-	return fmt.Sprintf("/orchestration/nodes/%s", name)
-}
-
-func (es *EtcdStorage) serviceKey(namespace, name string) string {
-	return fmt.Sprintf("/orchestration/services/%s/%s", namespace, name)
-}
-
-func (es *EtcdStorage) deploymentKey(namespace, name string) string {
-	return fmt.Sprintf("/orchestration/deployments/%s/%s", namespace, name)
-}
-
-// Pod operations
-func (es *EtcdStorage) SavePod(ctx context.Context, pod *types.Pod) error {
-	data, err := json.Marshal(pod)
-	if err != nil {
-		return fmt.Errorf("failed to marshal pod: %w", err)
-	}
-
-	key := es.podKey(pod.Metadata.Namespace, pod.Metadata.Name)
-	_, err = es.client.Put(ctx, key, string(data))
-	return err
-}
-
-func (es *EtcdStorage) GetPod(ctx context.Context, namespace, name string) (*types.Pod, error) {
-	key := es.podKey(namespace, name)
-	resp, err := es.client.Get(ctx, key)
+	c, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 5 * time.Second})
 	if err != nil {
 		return nil, err
 	}
-
-	if len(resp.Kvs) == 0 {
-		return nil, fmt.Errorf("pod not found: %s/%s", namespace, name)
-	}
-
-	var pod types.Pod
-	if err := json.Unmarshal(resp.Kvs[0].Value, &pod); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal pod: %w", err)
-	}
-
-	return &pod, nil
+	return &EtcdStorage{client: c}, nil
 }
-
+func (es *EtcdStorage) save(ctx context.Context, key string, value any, meta *types.ObjectMeta) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	result, err := es.client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(key), "=", meta.ResourceVersion)).Then(clientv3.OpPut(key, string(data))).Commit()
+	if err != nil {
+		return err
+	}
+	if !result.Succeeded {
+		return ErrConflict
+	}
+	meta.ResourceVersion = result.Header.Revision
+	return nil
+}
+func (es *EtcdStorage) Close() error { return es.client.Close() }
+func (es *EtcdStorage) SavePod(ctx context.Context, value *types.Pod) error {
+	return es.save(ctx, fmt.Sprintf("/orchestration/pods/%s/%s", value.Metadata.Namespace, value.Metadata.Name), value, &value.Metadata)
+}
+func (es *EtcdStorage) GetPod(ctx context.Context, namespace, name string) (*types.Pod, error) {
+	resp, err := es.client.Get(ctx, fmt.Sprintf("/orchestration/pods/%s/%s", namespace, name))
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, ErrNotFound
+	}
+	var value types.Pod
+	if err := json.Unmarshal(resp.Kvs[0].Value, &value); err != nil {
+		return nil, err
+	}
+	value.Metadata.ResourceVersion = resp.Kvs[0].ModRevision
+	return &value, nil
+}
 func (es *EtcdStorage) ListPods(ctx context.Context, namespace string) ([]*types.Pod, error) {
-	prefix := fmt.Sprintf("/orchestration/pods/%s/", namespace)
+	prefix := "/orchestration/pods/"
+	if namespace != "" {
+		prefix += namespace + "/"
+	}
 	resp, err := es.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
-
-	var pods []*types.Pod
+	values := make([]*types.Pod, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		var pod types.Pod
-		if err := json.Unmarshal(kv.Value, &pod); err != nil {
-			continue
+		var value types.Pod
+		if err := json.Unmarshal(kv.Value, &value); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", kv.Key, err)
 		}
-		pods = append(pods, &pod)
+		value.Metadata.ResourceVersion = kv.ModRevision
+		values = append(values, &value)
 	}
-
-	return pods, nil
+	return values, nil
 }
-
 func (es *EtcdStorage) DeletePod(ctx context.Context, namespace, name string) error {
-	key := es.podKey(namespace, name)
-	_, err := es.client.Delete(ctx, key)
-	return err
-}
-
-// Node operations
-func (es *EtcdStorage) SaveNode(ctx context.Context, node *types.Node) error {
-	data, err := json.Marshal(node)
+	result, err := es.client.Delete(ctx, fmt.Sprintf("/orchestration/pods/%s/%s", namespace, name))
 	if err != nil {
-		return fmt.Errorf("failed to marshal node: %w", err)
+		return err
 	}
-
-	key := es.nodeKey(node.Metadata.Name)
-	_, err = es.client.Put(ctx, key, string(data))
-	return err
+	if result.Deleted == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
-
+func (es *EtcdStorage) SaveNode(ctx context.Context, value *types.Node) error {
+	return es.save(ctx, "/orchestration/nodes/"+value.Metadata.Name, value, &value.Metadata)
+}
 func (es *EtcdStorage) GetNode(ctx context.Context, name string) (*types.Node, error) {
-	key := es.nodeKey(name)
-	resp, err := es.client.Get(ctx, key)
+	resp, err := es.client.Get(ctx, "/orchestration/nodes/"+name)
 	if err != nil {
 		return nil, err
 	}
-
 	if len(resp.Kvs) == 0 {
-		return nil, fmt.Errorf("node not found: %s", name)
+		return nil, ErrNotFound
 	}
-
-	var node types.Node
-	if err := json.Unmarshal(resp.Kvs[0].Value, &node); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal node: %w", err)
+	var value types.Node
+	if err := json.Unmarshal(resp.Kvs[0].Value, &value); err != nil {
+		return nil, err
 	}
-
-	return &node, nil
+	value.Metadata.ResourceVersion = resp.Kvs[0].ModRevision
+	return &value, nil
 }
-
 func (es *EtcdStorage) ListNodes(ctx context.Context) ([]*types.Node, error) {
 	prefix := "/orchestration/nodes/"
 	resp, err := es.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
-
-	var nodes []*types.Node
+	values := make([]*types.Node, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		var node types.Node
-		if err := json.Unmarshal(kv.Value, &node); err != nil {
-			continue
+		var value types.Node
+		if err := json.Unmarshal(kv.Value, &value); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", kv.Key, err)
 		}
-		nodes = append(nodes, &node)
+		value.Metadata.ResourceVersion = kv.ModRevision
+		values = append(values, &value)
 	}
-
-	return nodes, nil
+	return values, nil
 }
-
 func (es *EtcdStorage) DeleteNode(ctx context.Context, name string) error {
-	key := es.nodeKey(name)
-	_, err := es.client.Delete(ctx, key)
-	return err
-}
-
-// Service operations
-func (es *EtcdStorage) SaveService(ctx context.Context, service *types.Service) error {
-	data, err := json.Marshal(service)
+	result, err := es.client.Delete(ctx, "/orchestration/nodes/"+name)
 	if err != nil {
-		return fmt.Errorf("failed to marshal service: %w", err)
+		return err
 	}
-
-	key := es.serviceKey(service.Metadata.Namespace, service.Metadata.Name)
-	_, err = es.client.Put(ctx, key, string(data))
-	return err
+	if result.Deleted == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
-
+func (es *EtcdStorage) SaveService(ctx context.Context, value *types.Service) error {
+	return es.save(ctx, fmt.Sprintf("/orchestration/services/%s/%s", value.Metadata.Namespace, value.Metadata.Name), value, &value.Metadata)
+}
 func (es *EtcdStorage) GetService(ctx context.Context, namespace, name string) (*types.Service, error) {
-	key := es.serviceKey(namespace, name)
-	resp, err := es.client.Get(ctx, key)
+	resp, err := es.client.Get(ctx, fmt.Sprintf("/orchestration/services/%s/%s", namespace, name))
 	if err != nil {
 		return nil, err
 	}
-
 	if len(resp.Kvs) == 0 {
-		return nil, fmt.Errorf("service not found: %s/%s", namespace, name)
+		return nil, ErrNotFound
 	}
-
-	var service types.Service
-	if err := json.Unmarshal(resp.Kvs[0].Value, &service); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal service: %w", err)
+	var value types.Service
+	if err := json.Unmarshal(resp.Kvs[0].Value, &value); err != nil {
+		return nil, err
 	}
-
-	return &service, nil
+	value.Metadata.ResourceVersion = resp.Kvs[0].ModRevision
+	return &value, nil
 }
-
 func (es *EtcdStorage) ListServices(ctx context.Context, namespace string) ([]*types.Service, error) {
-	prefix := fmt.Sprintf("/orchestration/services/%s/", namespace)
+	prefix := "/orchestration/services/"
+	if namespace != "" {
+		prefix += namespace + "/"
+	}
 	resp, err := es.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
-
-	var services []*types.Service
+	values := make([]*types.Service, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		var service types.Service
-		if err := json.Unmarshal(kv.Value, &service); err != nil {
-			continue
+		var value types.Service
+		if err := json.Unmarshal(kv.Value, &value); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", kv.Key, err)
 		}
-		services = append(services, &service)
+		value.Metadata.ResourceVersion = kv.ModRevision
+		values = append(values, &value)
 	}
-
-	return services, nil
+	return values, nil
 }
-
 func (es *EtcdStorage) DeleteService(ctx context.Context, namespace, name string) error {
-	key := es.serviceKey(namespace, name)
-	_, err := es.client.Delete(ctx, key)
-	return err
-}
-
-// Deployment operations
-func (es *EtcdStorage) SaveDeployment(ctx context.Context, deployment *types.Deployment) error {
-	data, err := json.Marshal(deployment)
+	result, err := es.client.Delete(ctx, fmt.Sprintf("/orchestration/services/%s/%s", namespace, name))
 	if err != nil {
-		return fmt.Errorf("failed to marshal deployment: %w", err)
+		return err
 	}
-
-	key := es.deploymentKey(deployment.Metadata.Namespace, deployment.Metadata.Name)
-	_, err = es.client.Put(ctx, key, string(data))
-	return err
+	if result.Deleted == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
-
+func (es *EtcdStorage) SaveDeployment(ctx context.Context, value *types.Deployment) error {
+	return es.save(ctx, fmt.Sprintf("/orchestration/deployments/%s/%s", value.Metadata.Namespace, value.Metadata.Name), value, &value.Metadata)
+}
 func (es *EtcdStorage) GetDeployment(ctx context.Context, namespace, name string) (*types.Deployment, error) {
-	key := es.deploymentKey(namespace, name)
-	resp, err := es.client.Get(ctx, key)
+	resp, err := es.client.Get(ctx, fmt.Sprintf("/orchestration/deployments/%s/%s", namespace, name))
 	if err != nil {
 		return nil, err
 	}
-
 	if len(resp.Kvs) == 0 {
-		return nil, fmt.Errorf("deployment not found: %s/%s", namespace, name)
+		return nil, ErrNotFound
 	}
-
-	var deployment types.Deployment
-	if err := json.Unmarshal(resp.Kvs[0].Value, &deployment); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal deployment: %w", err)
+	var value types.Deployment
+	if err := json.Unmarshal(resp.Kvs[0].Value, &value); err != nil {
+		return nil, err
 	}
-
-	return &deployment, nil
+	value.Metadata.ResourceVersion = resp.Kvs[0].ModRevision
+	return &value, nil
 }
-
 func (es *EtcdStorage) ListDeployments(ctx context.Context, namespace string) ([]*types.Deployment, error) {
-	prefix := fmt.Sprintf("/orchestration/deployments/%s/", namespace)
+	prefix := "/orchestration/deployments/"
+	if namespace != "" {
+		prefix += namespace + "/"
+	}
 	resp, err := es.client.Get(ctx, prefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
-
-	var deployments []*types.Deployment
+	values := make([]*types.Deployment, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		var deployment types.Deployment
-		if err := json.Unmarshal(kv.Value, &deployment); err != nil {
-			continue
+		var value types.Deployment
+		if err := json.Unmarshal(kv.Value, &value); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", kv.Key, err)
 		}
-		deployments = append(deployments, &deployment)
+		value.Metadata.ResourceVersion = kv.ModRevision
+		values = append(values, &value)
 	}
-
-	return deployments, nil
+	return values, nil
 }
-
 func (es *EtcdStorage) DeleteDeployment(ctx context.Context, namespace, name string) error {
-	key := es.deploymentKey(namespace, name)
-	_, err := es.client.Delete(ctx, key)
-	return err
-}
-
-// Close closes the etcd connection
-func (es *EtcdStorage) Close() error {
-	return es.client.Close()
+	result, err := es.client.Delete(ctx, fmt.Sprintf("/orchestration/deployments/%s/%s", namespace, name))
+	if err != nil {
+		return err
+	}
+	if result.Deleted == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

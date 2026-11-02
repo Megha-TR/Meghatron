@@ -1,12 +1,14 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import { fetchJSON } from '@/lib/api';
+import Modal from '@/components/Modal';
 import StatusBadge from '@/components/StatusBadge';
 
 interface PodData {
-  metadata: { name: string; namespace: string; uid: string };
+  metadata: { name: string; namespace: string; uid: string; deletionTimestamp?: string };
   spec: { nodeName: string; containers: { name: string; image: string }[] };
-  status: { phase: string };
+  status: { phase: string; message?: string };
 }
 
 interface CreateForm {
@@ -26,19 +28,15 @@ export default function PodsPage() {
   const [deletingPod, setDeletingPod] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
-  const fetchPods = useCallback(async () => {
-    try {
-      const res = await fetch('/api/v1/pods/default');
-      if (!res.ok) throw new Error(`API error: ${res.status}`);
-      const data = await res.json();
-      setPods(Array.isArray(data) ? data : []);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch pods');
-    } finally {
-      setLoading(false);
-      setLastRefresh(new Date());
-    }
+  const fetchPods = useCallback(() => {
+    return fetchJSON<PodData[]>('/api/v1/pods/default')
+      .then(data => {
+        setPods(Array.isArray(data) ? data : []);
+        setError(null);
+        setLastRefresh(new Date());
+      })
+      .catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh pods'))
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
@@ -95,12 +93,12 @@ export default function PodsPage() {
   return (
     <div>
       {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex flex-wrap gap-4 items-center justify-between mb-8">
         <div>
           <h1 className="text-2xl font-bold text-white">Pods</h1>
           <p className="text-gray-400 mt-1 text-sm">Running containers in the default namespace</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2 bg-gray-800 rounded-lg px-3 py-2 border border-gray-700">
             <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
             <span className="text-xs text-gray-400">Auto-refresh 5s</span>
@@ -140,7 +138,7 @@ export default function PodsPage() {
 
       {/* Summary strip */}
       {!loading && pods.length > 0 && (
-        <div className="grid grid-cols-4 gap-4 mb-6">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
           {[
             { label: 'Total',     value: pods.length,                                             color: 'text-white' },
             { label: 'Running',   value: pods.filter(p => p.status?.phase === 'Running').length,  color: 'text-green-400' },
@@ -156,7 +154,7 @@ export default function PodsPage() {
       )}
 
       {/* Table */}
-      <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden">
+      <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-gray-700 bg-gray-900/50">
@@ -211,7 +209,8 @@ export default function PodsPage() {
                     </span>
                   </td>
                   <td className="px-6 py-4">
-                    <StatusBadge status={pod.status?.phase || 'Unknown'} />
+                    <StatusBadge status={pod.metadata.deletionTimestamp ? 'Terminating' : pod.status?.phase || 'Unknown'} />
+                    {pod.status?.message && <p className="text-xs text-amber-300 mt-2 max-w-sm break-words">{pod.status.message}</p>}
                   </td>
                   <td className="px-6 py-4">
                     <span className="text-gray-400 text-sm font-mono">{pod.spec?.nodeName || '—'}</span>
@@ -253,18 +252,17 @@ export default function PodsPage() {
 
       {!loading && pods.length > 0 && (
         <p className="text-xs text-gray-600 mt-3 text-right">
-          {pods.length} pod{pods.length !== 1 ? 's' : ''} &middot; Last refreshed {lastRefresh.toLocaleTimeString()}
+          {pods.length} pod{pods.length !== 1 ? 's' : ''} &middot; Last refreshed {lastRefresh?.toLocaleTimeString() ?? 'Never'}
         </p>
       )}
 
       {/* Create Pod Modal */}
       {showCreate && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-800 rounded-xl border border-gray-700 w-full max-w-md shadow-2xl">
+        <Modal title="Create Pod" onClose={() => { setShowCreate(false); setCreateError(null); }}>
             <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
               <h2 className="text-lg font-semibold text-white">Create Pod</h2>
               <button onClick={() => { setShowCreate(false); setCreateError(null); }}
-                className="text-gray-400 hover:text-white transition-colors">
+                aria-label="Close dialog" className="text-gray-400 hover:text-white transition-colors">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                 </svg>
@@ -277,9 +275,10 @@ export default function PodsPage() {
                 </div>
               )}
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">Pod Name</label>
-                <input
+                <label htmlFor="pods-pod-name" className="block text-sm font-medium text-gray-300 mb-1.5">Pod Name</label>
+                <input id="pods-pod-name"
                   type="text"
+                  pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?" maxLength={63}
                   value={form.name}
                   onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
                   placeholder="e.g. my-nginx"
@@ -288,8 +287,8 @@ export default function PodsPage() {
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1.5">Container Image</label>
-                <input
+                <label htmlFor="pods-container-image" className="block text-sm font-medium text-gray-300 mb-1.5">Container Image</label>
+                <input id="pods-container-image"
                   type="text"
                   value={form.image}
                   onChange={e => setForm(f => ({ ...f, image: e.target.value }))}
@@ -309,8 +308,7 @@ export default function PodsPage() {
                 </button>
               </div>
             </form>
-          </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

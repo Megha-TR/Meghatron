@@ -4,43 +4,47 @@ import "time"
 
 // Pod represents a containerized application unit
 type Pod struct {
-	Metadata   ObjectMeta            `json:"metadata"`
-	Spec       PodSpec               `json:"spec"`
-	Status     PodStatus             `json:"status"`
-	CreatedAt  time.Time             `json:"createdAt"`
-	UpdatedAt  time.Time             `json:"updatedAt"`
+	Metadata  ObjectMeta `json:"metadata"`
+	Spec      PodSpec    `json:"spec"`
+	Status    PodStatus  `json:"status"`
+	CreatedAt time.Time  `json:"createdAt"`
+	UpdatedAt time.Time  `json:"updatedAt"`
 }
 
 // ObjectMeta contains metadata for Kubernetes objects
 type ObjectMeta struct {
-	Name      string            `json:"name"`
-	Namespace string            `json:"namespace"`
-	Labels    map[string]string `json:"labels"`
-	UID       string            `json:"uid"`
+	Name              string            `json:"name"`
+	Namespace         string            `json:"namespace"`
+	Labels            map[string]string `json:"labels"`
+	UID               string            `json:"uid"`
+	ResourceVersion   int64             `json:"resourceVersion,omitempty"`
+	OwnerUID          string            `json:"ownerUID,omitempty"`
+	DeletionTimestamp *time.Time        `json:"deletionTimestamp,omitempty"`
 }
 
 // PodSpec defines the specification for a Pod
 type PodSpec struct {
-	Containers    []Container           `json:"containers"`
-	RestartPolicy RestartPolicy         `json:"restartPolicy"`
-	NodeName      string                `json:"nodeName,omitempty"`
-	Resources     ResourceRequirements  `json:"resources,omitempty"`
+	Containers    []Container          `json:"containers"`
+	RestartPolicy RestartPolicy        `json:"restartPolicy"`
+	NodeName      string               `json:"nodeName,omitempty"`
+	Resources     ResourceRequirements `json:"resources,omitempty"`
 }
 
 // Container defines a container within a Pod
 type Container struct {
-	Name            string               `json:"name"`
-	Image           string               `json:"image"`
-	Ports           []ContainerPort      `json:"ports,omitempty"`
-	Env             []EnvVar             `json:"env,omitempty"`
-	Resources       ResourceRequirements `json:"resources,omitempty"`
-	RestartPolicy   RestartPolicy        `json:"restartPolicy"`
+	Name          string               `json:"name"`
+	Image         string               `json:"image"`
+	Ports         []ContainerPort      `json:"ports,omitempty"`
+	Env           []EnvVar             `json:"env,omitempty"`
+	Resources     ResourceRequirements `json:"resources,omitempty"`
+	RestartPolicy RestartPolicy        `json:"restartPolicy"`
 }
 
 // ContainerPort defines a port exposed by a container
 type ContainerPort struct {
 	Name          string `json:"name,omitempty"`
 	ContainerPort int32  `json:"containerPort"`
+	HostPort      int32  `json:"hostPort,omitempty"`
 	Protocol      string `json:"protocol,omitempty"`
 }
 
@@ -70,22 +74,23 @@ const (
 
 // PodStatus represents the current status of a Pod
 type PodStatus struct {
-	Phase             PodPhase     `json:"phase"`
+	Phase             PodPhase          `json:"phase"`
 	ContainerStatuses []ContainerStatus `json:"containerStatuses,omitempty"`
-	Message           string       `json:"message,omitempty"`
-	HostIP            string       `json:"hostIP,omitempty"`
-	PodIP             string       `json:"podIP,omitempty"`
+	Message           string            `json:"message,omitempty"`
+	HostIP            string            `json:"hostIP,omitempty"`
+	PodIP             string            `json:"podIP,omitempty"`
 }
 
 // PodPhase represents the phase of a Pod
 type PodPhase string
 
 const (
-	PodPending   PodPhase = "Pending"
-	PodRunning   PodPhase = "Running"
-	PodSucceeded PodPhase = "Succeeded"
-	PodFailed    PodPhase = "Failed"
-	PodUnknown   PodPhase = "Unknown"
+	PodPending     PodPhase = "Pending"
+	PodRunning     PodPhase = "Running"
+	PodSucceeded   PodPhase = "Succeeded"
+	PodFailed      PodPhase = "Failed"
+	PodUnknown     PodPhase = "Unknown"
+	PodTerminating PodPhase = "Terminating"
 )
 
 // ContainerStatus represents the status of a container
@@ -99,13 +104,13 @@ type ContainerStatus struct {
 
 // Node represents a worker node in the cluster
 type Node struct {
-	Metadata      ObjectMeta        `json:"metadata"`
-	Status        NodeStatus        `json:"status"`
-	Capacity      ResourceList      `json:"capacity"`
-	Allocatable   ResourceList      `json:"allocatable"`
-	CreatedAt     time.Time         `json:"createdAt"`
-	UpdatedAt     time.Time         `json:"updatedAt"`
-	LastHeartbeat time.Time         `json:"lastHeartbeat"`
+	Metadata      ObjectMeta   `json:"metadata"`
+	Status        NodeStatus   `json:"status"`
+	Capacity      ResourceList `json:"capacity"`
+	Allocatable   ResourceList `json:"allocatable"`
+	CreatedAt     time.Time    `json:"createdAt"`
+	UpdatedAt     time.Time    `json:"updatedAt"`
+	LastHeartbeat time.Time    `json:"lastHeartbeat"`
 }
 
 // NodeStatus represents the status of a Node
@@ -119,19 +124,19 @@ type NodeStatus struct {
 type NodePhase string
 
 const (
-	NodePending   NodePhase = "Pending"
-	NodeReady     NodePhase = "Ready"
-	NodeNotReady  NodePhase = "NotReady"
-	NodeUnknown   NodePhase = "Unknown"
+	NodePending  NodePhase = "Pending"
+	NodeReady    NodePhase = "Ready"
+	NodeNotReady NodePhase = "NotReady"
+	NodeUnknown  NodePhase = "Unknown"
 )
 
 // Service represents a network service
 type Service struct {
-	Metadata ObjectMeta   `json:"metadata"`
-	Spec     ServiceSpec  `json:"spec"`
-	Status   ServiceStatus `json:"status"`
-	CreatedAt time.Time    `json:"createdAt"`
-	UpdatedAt time.Time    `json:"updatedAt"`
+	Metadata  ObjectMeta    `json:"metadata"`
+	Spec      ServiceSpec   `json:"spec"`
+	Status    ServiceStatus `json:"status"`
+	CreatedAt time.Time     `json:"createdAt"`
+	UpdatedAt time.Time     `json:"updatedAt"`
 }
 
 // ServiceSpec defines the specification for a Service
@@ -153,8 +158,8 @@ type ServicePort struct {
 type ServiceType string
 
 const (
-	ServiceTypeClusterIP   ServiceType = "ClusterIP"
-	ServiceTypeNodePort    ServiceType = "NodePort"
+	ServiceTypeClusterIP    ServiceType = "ClusterIP"
+	ServiceTypeNodePort     ServiceType = "NodePort"
 	ServiceTypeLoadBalancer ServiceType = "LoadBalancer"
 )
 
@@ -166,11 +171,11 @@ type ServiceStatus struct {
 
 // Deployment represents a deployment resource
 type Deployment struct {
-	Metadata ObjectMeta       `json:"metadata"`
-	Spec     DeploymentSpec   `json:"spec"`
-	Status   DeploymentStatus `json:"status"`
-	CreatedAt time.Time       `json:"createdAt"`
-	UpdatedAt time.Time       `json:"updatedAt"`
+	Metadata  ObjectMeta       `json:"metadata"`
+	Spec      DeploymentSpec   `json:"spec"`
+	Status    DeploymentStatus `json:"status"`
+	CreatedAt time.Time        `json:"createdAt"`
+	UpdatedAt time.Time        `json:"updatedAt"`
 }
 
 // DeploymentSpec defines the specification for a Deployment

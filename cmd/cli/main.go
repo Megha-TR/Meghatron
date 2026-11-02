@@ -2,360 +2,126 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/orchestration-lite/core/pkg/storage"
-	"github.com/orchestration-lite/core/pkg/types"
-	"github.com/google/uuid"
 	"github.com/urfave/cli/v2"
 )
 
-var etcdEndpoint string
-var serverEndpoint string
+var client = &http.Client{Timeout: 15 * time.Second}
 
-func main() {
-	app := &cli.App{
-		Name:  "orc",
-		Usage: "Orchestration CLI",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:        "etcd",
-				Usage:       "etcd endpoint",
-				Value:       "localhost:2379",
-				Destination: &etcdEndpoint,
-			},
-			&cli.StringFlag{
-				Name:        "server",
-				Usage:       "orchestration server address",
-				Value:       "http://localhost:8080",
-				Destination: &serverEndpoint,
-			},
-		},
-		Commands: []*cli.Command{
-			{
-				Name:  "pod",
-				Usage: "Manage pods",
-				Subcommands: []*cli.Command{
-					{
-						Name:   "create",
-						Usage:  "Create a pod",
-						Action: createPod,
-					},
-					{
-						Name:   "get",
-						Usage:  "Get a pod",
-						Action: getPod,
-					},
-					{
-						Name:   "list",
-						Usage:  "List pods",
-						Action: listPods,
-					},
-					{
-						Name:   "delete",
-						Usage:  "Delete a pod",
-						Action: deletePod,
-					},
-				},
-			},
-			{
-				Name:  "node",
-				Usage: "Manage nodes",
-				Subcommands: []*cli.Command{
-					{
-						Name:   "get",
-						Usage:  "Get a node",
-						Action: getNode,
-					},
-					{
-						Name:   "list",
-						Usage:  "List nodes",
-						Action: listNodes,
-					},
-				},
-			},
-			{
-				Name:  "deployment",
-				Usage: "Manage deployments",
-				Subcommands: []*cli.Command{
-					{
-						Name:   "create",
-						Usage:  "Create a deployment",
-						Action: createDeployment,
-					},
-					{
-						Name:   "get",
-						Usage:  "Get a deployment",
-						Action: getDeployment,
-					},
-					{
-						Name:   "list",
-						Usage:  "List deployments",
-						Action: listDeployments,
-					},
-				},
-			},
-		},
+func request(c *cli.Context, method, path string, body any) error {
+	var data []byte
+	var err error
+	if body != nil {
+		data, err = json.Marshal(body)
+		if err != nil {
+			return err
+		}
 	}
-
-	if err := app.Run(os.Args); err != nil {
-		log.Fatal(err)
-	}
-}
-
-// Pod commands
-func createPod(c *cli.Context) error {
-	if c.NArg() < 2 {
-		return fmt.Errorf("usage: orc pod create <name> <image>")
-	}
-
-	name := c.Args().Get(0)
-	image := c.Args().Get(1)
-
-	pod := &types.Pod{
-		Metadata: types.ObjectMeta{
-			Name:      name,
-			Namespace: "default",
-			UID:       uuid.New().String(),
-		},
-		Spec: types.PodSpec{
-			RestartPolicy: types.RestartPolicyAlways,
-			Containers: []types.Container{
-				{
-					Name:          name,
-					Image:         image,
-					RestartPolicy: types.RestartPolicyAlways,
-				},
-			},
-		},
-	}
-
-	body, _ := json.Marshal(pod)
-	resp, err := http.Post(serverEndpoint+"/api/v1/pods", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(c.Context, method, strings.TrimRight(c.String("server"), "/")+"/api/v1/"+path, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("failed to reach server at %s: %w", serverEndpoint, err)
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		var errResp map[string]string
-		json.NewDecoder(resp.Body).Decode(&errResp)
-		return fmt.Errorf("server error: %s", errResp["error"])
-	}
-
-	fmt.Printf("Pod %s created\n", name)
-	return nil
-}
-
-func getPod(c *cli.Context) error {
-	if c.NArg() < 1 {
-		return fmt.Errorf("usage: orc pod get <name>")
-	}
-
-	name := c.Args().Get(0)
-
-	store, err := storage.NewEtcdStorage([]string{etcdEndpoint})
+	result, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return err
 	}
-	defer store.Close()
-
-	pod, err := store.GetPod(context.Background(), "default", name)
-	if err != nil {
-		return err
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("API %d: %s", resp.StatusCode, strings.TrimSpace(string(result)))
 	}
-
-	data, _ := json.MarshalIndent(pod, "", "  ")
-	fmt.Println(string(data))
-	return nil
-}
-
-func listPods(c *cli.Context) error {
-	store, err := storage.NewEtcdStorage([]string{etcdEndpoint})
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	pods, err := store.ListPods(context.Background(), "default")
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("NAME\tNAMESPACE\tPHASE\tNODE\n")
-	for _, pod := range pods {
-		fmt.Printf("%s\t%s\t%s\t%s\n", pod.Metadata.Name, pod.Metadata.Namespace, pod.Status.Phase, pod.Spec.NodeName)
+	var pretty bytes.Buffer
+	if json.Indent(&pretty, result, "", "  ") == nil {
+		fmt.Println(pretty.String())
+	} else {
+		fmt.Println(string(result))
 	}
 	return nil
 }
-
-func deletePod(c *cli.Context) error {
-	if c.NArg() < 1 {
-		return fmt.Errorf("usage: orc pod delete <name>")
+func path(c *cli.Context, kind string, withName bool) string {
+	p := kind
+	if kind != "nodes" {
+		p += "/" + url.PathEscape(c.String("namespace"))
 	}
-
-	name := c.Args().Get(0)
-
-	store, err := storage.NewEtcdStorage([]string{etcdEndpoint})
-	if err != nil {
-		return err
+	if withName {
+		p += "/" + url.PathEscape(c.Args().First())
 	}
-	defer store.Close()
-
-	if err := store.DeletePod(context.Background(), "default", name); err != nil {
-		return err
-	}
-
-	fmt.Printf("Pod %s deleted\n", name)
-	return nil
+	return p
 }
-
-// Node commands
-func getNode(c *cli.Context) error {
-	if c.NArg() < 1 {
-		return fmt.Errorf("usage: orc node get <name>")
-	}
-
-	name := c.Args().Get(0)
-
-	store, err := storage.NewEtcdStorage([]string{etcdEndpoint})
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	node, err := store.GetNode(context.Background(), name)
-	if err != nil {
-		return err
-	}
-
-	data, _ := json.MarshalIndent(node, "", "  ")
-	fmt.Println(string(data))
-	return nil
-}
-
-func listNodes(c *cli.Context) error {
-	store, err := storage.NewEtcdStorage([]string{etcdEndpoint})
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	nodes, err := store.ListNodes(context.Background())
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("NAME\tREADY\tCPU\tMEMORY\n")
-	for _, node := range nodes {
-		ready := "False"
-		if node.Status.Ready {
-			ready = "True"
+func app() *cli.App {
+	a := &cli.App{Name: "orc", Usage: "Manage Meghatron through its REST API", Flags: []cli.Flag{&cli.StringFlag{Name: "server", Value: "http://localhost:8080", EnvVars: []string{"MEGHATRON_SERVER"}}, &cli.StringFlag{Name: "namespace", Aliases: []string{"n"}, Value: "default"}}}
+	for _, kind := range []string{"pod", "node", "deployment"} {
+		kind := kind
+		plural := kind + "s"
+		command := &cli.Command{Name: kind, Subcommands: []*cli.Command{
+			{Name: "list", Action: func(c *cli.Context) error { return request(c, "GET", path(c, plural, false), nil) }},
+			{Name: "get", ArgsUsage: "<name>", Action: func(c *cli.Context) error {
+				if c.NArg() != 1 {
+					return fmt.Errorf("provide one name")
+				}
+				return request(c, "GET", path(c, plural, true), nil)
+			}},
+		}}
+		if kind != "node" {
+			command.Subcommands = append(command.Subcommands, &cli.Command{Name: "delete", ArgsUsage: "<name>", Action: func(c *cli.Context) error {
+				if c.NArg() != 1 {
+					return fmt.Errorf("provide one name")
+				}
+				return request(c, "DELETE", path(c, plural, true), nil)
+			}})
+			command.Subcommands = append(command.Subcommands, &cli.Command{Name: "create", ArgsUsage: "<name> <image> [replicas]", Action: func(c *cli.Context) error {
+				if c.NArg() < 2 || c.NArg() > 3 || (kind == "pod" && c.NArg() != 2) {
+					return fmt.Errorf("usage: orc %s create <name> <image> [replicas]", kind)
+				}
+				name, image := c.Args().Get(0), c.Args().Get(1)
+				meta := map[string]any{"name": name, "namespace": c.String("namespace")}
+				spec := map[string]any{"containers": []any{map[string]any{"name": "app", "image": image}}}
+				if kind == "deployment" {
+					replicas := 1
+					if c.NArg() == 3 {
+						var err error
+						replicas, err = strconv.Atoi(c.Args().Get(2))
+						if err != nil {
+							return err
+						}
+					}
+					spec = map[string]any{"replicas": replicas, "selector": map[string]string{"app": name}, "template": map[string]any{"metadata": map[string]any{"labels": map[string]string{"app": name}}, "spec": spec}}
+				}
+				return request(c, "POST", plural, map[string]any{"metadata": meta, "spec": spec})
+			}})
 		}
-		fmt.Printf("%s\t%s\t%s\t%s\n", node.Metadata.Name, ready, node.Capacity["cpu"], node.Capacity["memory"])
+		if kind == "deployment" {
+			command.Subcommands = append(command.Subcommands, &cli.Command{Name: "scale", ArgsUsage: "<name> <replicas>", Action: func(c *cli.Context) error {
+				if c.NArg() != 2 {
+					return fmt.Errorf("provide name and replica count")
+				}
+				n, err := strconv.Atoi(c.Args().Get(1))
+				if err != nil {
+					return err
+				}
+				return request(c, "PATCH", path(c, plural, true)+"/scale", map[string]int{"replicas": n})
+			}})
+		}
+		a.Commands = append(a.Commands, command)
 	}
-	return nil
+	return a
 }
-
-// Deployment commands
-func createDeployment(c *cli.Context) error {
-	if c.NArg() < 3 {
-		return fmt.Errorf("usage: orc deployment create <name> <image> <replicas>")
+func main() {
+	if err := app().Run(os.Args); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-
-	name := c.Args().Get(0)
-	image := c.Args().Get(1)
-	var replicas int32
-	fmt.Sscanf(c.Args().Get(2), "%d", &replicas)
-
-	store, err := storage.NewEtcdStorage([]string{etcdEndpoint})
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	deployment := &types.Deployment{
-		Metadata: types.ObjectMeta{
-			Name:      name,
-			Namespace: "default",
-			UID:       uuid.New().String(),
-		},
-		Spec: types.DeploymentSpec{
-			Replicas: replicas,
-			Selector: map[string]string{
-				"app": name,
-			},
-			Template: types.PodTemplateSpec{
-				Metadata: types.ObjectMeta{
-					Labels: map[string]string{
-						"app": name,
-					},
-				},
-				Spec: types.PodSpec{
-					RestartPolicy: types.RestartPolicyAlways,
-					Containers: []types.Container{
-						{
-							Name:            name,
-							Image:           image,
-							RestartPolicy:   types.RestartPolicyAlways,
-						},
-					},
-				},
-			},
-		},
-	}
-
-	if err := store.SaveDeployment(context.Background(), deployment); err != nil {
-		return err
-	}
-
-	fmt.Printf("Deployment %s created with %d replicas\n", name, replicas)
-	return nil
-}
-
-func getDeployment(c *cli.Context) error {
-	if c.NArg() < 1 {
-		return fmt.Errorf("usage: orc deployment get <name>")
-	}
-
-	name := c.Args().Get(0)
-
-	store, err := storage.NewEtcdStorage([]string{etcdEndpoint})
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	deployment, err := store.GetDeployment(context.Background(), "default", name)
-	if err != nil {
-		return err
-	}
-
-	data, _ := json.MarshalIndent(deployment, "", "  ")
-	fmt.Println(string(data))
-	return nil
-}
-
-func listDeployments(c *cli.Context) error {
-	store, err := storage.NewEtcdStorage([]string{etcdEndpoint})
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-
-	deployments, err := store.ListDeployments(context.Background(), "default")
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("NAME\tREPLICAS\tUPDATED\tAVAILABLE\n")
-	for _, dep := range deployments {
-		fmt.Printf("%s\t%d\t%d\t%d\n", dep.Metadata.Name, dep.Spec.Replicas, dep.Status.UpdatedReplicas, dep.Status.AvailableReplicas)
-	}
-	return nil
 }
